@@ -489,3 +489,29 @@ def test_step_keeps_full_reasoning():
     joined = "\n".join(r.transcript.lines)
     assert "First sentence" in joined and "Second sentence" in joined
     assert "x" * 600 in joined  # no truncation
+
+
+def test_discussion_turn_renders_without_tools(tmp_path, monkeypatch):
+    """A content-only reply (no tool calls) must reach the transcript,
+    so discussion loops are visible turn by turn."""
+    import json as _j
+
+    import agent as _agent
+
+    seq = [
+        {"content": "Here is my take: splitting helps readability."},
+        {"content": "", "tool_calls": [
+            {"id": "c1", "function": {
+                "name": "done",
+                "arguments": _j.dumps({"summary": "discussed"}),
+            }},
+        ]},
+    ]
+    monkeypatch.setattr(_agent, "llm_call", lambda *a, **k: seq.pop(0))
+    r = TuiRenderer(model_name="m", session_id="s")
+    out = _agent.drive(
+        _agent.new_conversation("let us discuss", tmp_path),
+        tmp_path, max_steps=4, renderer=r,
+    )
+    assert out == "discussed"
+    assert any("Here is my take" in l for l in r.transcript.lines)
