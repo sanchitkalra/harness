@@ -28,8 +28,15 @@ K_SUMMARY = "summary"
 K_SUMMARY_ERR = "summary_err"
 K_PLAIN = "plain"
 
-# Input box height in rows (soft-wrapped, single logical line).
-INPUT_ROWS = 3
+# Minimum transcript rows to keep while the input box grows.
+MIN_TRANSCRIPT_ROWS = 3
+
+
+def input_height_for(needed_rows: int, screen_h: int) -> int:
+    """Pure layout: input grows to fit needed_rows, capped so the
+    transcript keeps at least MIN_TRANSCRIPT_ROWS plus 1 status row."""
+    max_h = max(1, screen_h - 1 - MIN_TRANSCRIPT_ROWS)
+    return max(1, min(max(1, needed_rows), max_h))
 
 
 def wrap_line(line: str, width: int) -> list[str]:
@@ -167,6 +174,24 @@ class TranscriptBuffer:
             self._lines.append(text)
             self._kinds.append(kind)
         self._cap()
+
+    def insert_items(self, index: int, items: list[tuple[str, str]]) -> None:
+        """Insert (kind, text) items at index (for inline expansion)."""
+        index = max(0, min(index, len(self._lines)))
+        for off, (kind, text) in enumerate(items):
+            self._lines.insert(index + off, text)
+            self._kinds.insert(index + off, kind)
+        self._cap()
+
+    def delete_range(self, start: int, end: int) -> None:
+        """Delete lines in [start, end)."""
+        del self._lines[max(0, start):max(0, end)]
+        del self._kinds[max(0, start):max(0, end)]
+
+    def set_line(self, index: int, text: str) -> None:
+        """Replace one line's text (kind unchanged)."""
+        if 0 <= index < len(self._lines):
+            self._lines[index] = text
 
     def extend(self, lines: Iterable[str]) -> None:
         for ln in lines:
@@ -426,6 +451,9 @@ class TuiRenderer:
         self._batch: list[dict] | None = None
         self._batch_start: int = 0
         self._attrs: dict[str, int] = {}  # kind -> curses attr, filled in start_curses
+        self._collapsed: dict[int, dict] = {}  # buf_index -> {text, details, expanded}
+        self._last_drawn: list[int | None] = []  # per transcript row -> buf index (for clicks)
+        self._input_h: int = 3
 
     # ---- pure state update ----
 
@@ -455,11 +483,52 @@ class TuiRenderer:
         self._batch = None
         if not batch:
             return
+        details = self.transcript.items()[self._batch_start:]
         text, has_error = summarize_batch([(e["name"], e["hint"], e["ok"]) for e in batch])
         marker = "✖" if has_error else "✔"
         kind = K_SUMMARY_ERR if has_error else K_SUMMARY
-        self.transcript.collapse_from(self._batch_start, [(kind, f"{marker} ↳ {text}")])
+        summary = f"{marker} ↳ {text}  [+]"
+        self.transcript.collapse_from(self._batch_start, [(kind, summary)])
+        idx = len(self.transcript) - 1  # post-cap index of the summary
+        self._collapsed[idx] = {"text": summary, "details": details, "expanded": False}
         self._redraw_transcript_if_needed()
+
+    def toggle_at_index(self, i: int) -> bool:
+        """Expand/collapse a summary line inline. Returns True if toggled."""
+        rec = self._collapsed.get(i)
+        if rec is None:
+            return False
+        cur = self.transcript.lines
+        if i >= len(cur) or cur[i] != rec["text"]:
+            del self._collapsed[i]  # stale (cap shifted the buffer)
+            return False
+        if rec["expanded"]:
+            k = len(rec["details"])
+            self.transcript.delete_range(i + 1, i + 1 + k)
+            rec["text"] = rec["text"].replace("  [–]", "  [+]")
+            self.transcript.set_line(i, rec["text"])
+            rec["expanded"] = False
+            for j in [x for x in self._collapsed if x > i]:
+                self._collapsed[j - k] = self._collapsed.pop(j)
+        else:
+            self.transcript.insert_items(i + 1, rec["details"])
+            rec["text"] = rec["text"].replace("  [+]", "  [–]")
+            self.transcript.set_line(i, rec["text"])
+            rec["expanded"] = True
+            k = len(rec["details"])
+            for j in sorted([x for x in self._collapsed if x > i], reverse=True):
+                self._collapsed[j + k] = self._collapsed.pop(j)
+        self._redraw_transcript_if_needed()
+        return True
+
+    def toggle_at_row(self, y: int) -> bool:
+        """Click handler: transcript row y -> buffer index -> toggle."""
+        if y < 0 or y >= len(self._last_drawn):
+            return False
+        idx = self._last_drawn[y]
+        if idx is None:
+            return False
+        return self.toggle_at_index(idx)
 
     def step(self, num: int, total: int, text: str) -> None:
         self.step_count = num
@@ -534,6 +603,10 @@ class TuiRenderer:
             curses.cbreak()
             self._stdscr.keypad(True)
             try:
+                curses.mousemask(curses.BUTTON1_CLICKED)
+            except Exception:
+                pass
+            try:
                 curses.curs_set(1)
             except curses.error:
                 pass
@@ -591,7 +664,7 @@ class TuiRenderer:
 
     # ---- window setup / drawing (curses part) ----
 
-    def _setup_windows(self) -> None:
+    def _setup_windows(self, input_h: int | None = None) -> None:
         if self._stdscr is None:
             return
         try:
@@ -605,8 +678,11 @@ class TuiRenderer:
         self._height = h
         self._width = w
         status_h = 1
-        input_h = INPUT_ROWS
+        if input_h is None:
+            input_h = self._input_h
+        input_h = max(1, input_h)
         transcript_h = max(1, h - status_h - input_h)
+        self._input_h = max(1, min(input_h, h - 2))  # status row + >=1 transcript row
         self._transcript_height = transcript_h
         try:
             self._transcript_win = curses.newwin(transcript_h, w, 0, 0)
@@ -646,10 +722,10 @@ class TuiRenderer:
             height = self._transcript_height
             width = max(8, self._width)
             # wrap first, then take the bottom window (wrapped continuation counts as lines)
-            wrapped: list[tuple[str, str]] = []
-            for kind, line in self.transcript.items():
+            wrapped: list[tuple[int, str, str]] = []  # (buf_index, kind, chunk)
+            for buf_idx, (kind, line) in enumerate(self.transcript.items()):
                 for chunk in wrap_line(line, width - 1):
-                    wrapped.append((kind, chunk))
+                    wrapped.append((buf_idx, kind, chunk))
             if self._scroll_offset:
                 total = len(wrapped)
                 max_offset = max(0, total - height)
@@ -658,7 +734,8 @@ class TuiRenderer:
                 vis = wrapped[start:start + height]
             else:
                 vis = wrapped[max(0, len(wrapped) - height):]
-            for idx, (kind, chunk) in enumerate(vis):
+            self._last_drawn = [buf_idx for buf_idx, _, _ in vis]
+            for idx, (_, kind, chunk) in enumerate(vis):
                 if idx >= height:
                     break
                 try:
@@ -700,14 +777,15 @@ class TuiRenderer:
         try:
             import curses
             self._input_win.erase()
-            rows, crow, ccol = wrap_input(prompt, input_buf.text, input_buf.cursor, self._width, INPUT_ROWS)
+            max_rows = max(1, self._input_h)
+            rows, crow, ccol = wrap_input(prompt, input_buf.text, input_buf.cursor, self._width, max_rows)
             for i, row in enumerate(rows):
-                if i >= INPUT_ROWS:
+                if i >= max_rows:
                     break
                 self._input_win.addnstr(i, 0, row, max(0, self._width - 1))
             try:
                 self._input_win.move(
-                    max(0, min(crow, INPUT_ROWS - 1)),
+                    max(0, min(crow, max_rows - 1)),
                     max(0, min(ccol, self._width - 1)),
                 )
             except curses.error:
@@ -803,9 +881,12 @@ class TuiRenderer:
         import curses
 
         input_buf = InputBuffer()
-        self._setup_windows()  # ensure size up to date
+        self._setup_windows()  # real dims before first layout
 
         while True:
+            # grow the input box to fit, transcript takes the rest
+            needed = len(wrap_line(prompt + input_buf.text, max(8, self._width)))
+            self._setup_windows(input_height_for(needed, self._height))
             self._draw_transcript()
             self._draw_status()
             self._draw_input(input_buf, prompt)
@@ -859,6 +940,20 @@ class TuiRenderer:
             else:
                 # int keycode
                 key = wch
+                if key == curses.KEY_MOUSE:
+                    try:
+                        _, _mx, my, _, bstate = curses.getmouse()
+                    except Exception:
+                        continue
+                    try:
+                        clicked = bool(bstate & curses.BUTTON1_CLICKED)
+                    except Exception:
+                        clicked = True
+                    if clicked and my < self._transcript_height:
+                        self.toggle_at_row(my)
+                        self._draw_transcript()
+                        self._draw_input(input_buf, prompt)
+                    continue
                 if key in (curses.KEY_ENTER, 10, 13):
                     line = input_buf.text
                     self.transcript.append(f"> {line}", K_INPUT)

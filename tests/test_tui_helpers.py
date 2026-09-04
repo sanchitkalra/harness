@@ -300,3 +300,62 @@ def test_renderer_error_summary():
     summaries = [l for l in r.transcript.lines if "↳" in l]
     assert len(summaries) == 1
     assert "✖" in summaries[0] and "1 error(s)" in summaries[0]
+
+
+def test_input_height_for():
+    from tui import input_height_for
+    assert input_height_for(1, 24) == 1
+    assert input_height_for(10, 24) == 10
+    # capped so transcript keeps >=3 rows + status
+    assert input_height_for(100, 24) == 24 - 1 - 3
+    assert input_height_for(100, 6) == 6 - 1 - 3
+    assert input_height_for(5, 4) == 1  # tiny screen: floor of 1
+
+
+def test_toggle_expand_collapse():
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.step(1, 5, "work")
+    r.begin_tools(1)
+    r.tool_call(1, "read_file", '{"path": "a.txt"}')
+    r.tool_result("read_file", "lines 1-2 of 2\nhi")
+    r.end_tools()
+    assert len(r._collapsed) == 1
+    idx = next(iter(r._collapsed))
+    assert r.transcript.lines[idx].endswith("[+]")
+    # expand: details back inline, marker flips
+    assert r.toggle_at_index(idx) is True
+    lines = r.transcript.lines
+    assert any("exit=0" in l or "hi" in l for l in lines) or any("lines 1-2" in l for l in lines)
+    assert r.transcript.lines[idx].endswith("[–]")
+    # collapse again
+    assert r.toggle_at_index(idx) is True
+    assert r.transcript.lines[idx].endswith("[+]")
+    assert not any("lines 1-2" in l for l in r.transcript.lines)
+
+
+def test_toggle_unknown_and_stale():
+    r = TuiRenderer(model_name="m", session_id="s")
+    assert r.toggle_at_index(99) is False
+    assert r.toggle_at_row(0) is False  # nothing drawn
+    r.begin_tools(1)
+    r.tool_call(1, "bash", '{"command": "echo hi"}')
+    r.tool_result("bash", "exit=0")
+    r.end_tools()
+    idx = next(iter(r._collapsed))
+    r.transcript.clear()  # cap-like shift: summary gone
+    assert r.toggle_at_index(idx) is False  # stale guard, no crash
+
+
+def test_toggle_row_mapping():
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.transcript.append("plain line")
+    r.begin_tools(1)
+    r.tool_call(1, "bash", '{"command": "echo hi"}')
+    r.tool_result("bash", "exit=0")
+    r.end_tools()
+    idx = next(iter(r._collapsed))
+    assert idx == 1
+    r._last_drawn = [0, 1]  # fabricated draw map: row 0 plain, row 1 summary
+    assert r.toggle_at_row(1) is True
+    assert r.toggle_at_row(0) is False  # plain line, no record
+    assert r.toggle_at_row(99) is False
