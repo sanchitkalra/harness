@@ -20,6 +20,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import ui
+
 MAX_OUTPUT_CHARS = 4000
 DEFAULT_MAX_STEPS = 30
 DEFAULT_TIMEOUT_S = 30
@@ -276,7 +278,7 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
         if text:
-            print(f"[step {step}] {text[:300]}")
+            ui.step(step, max_steps, text)
         if not calls:  # model talked without acting: nudge it back to tools
             idle_turns += 1
             if idle_turns >= MAX_IDLE_TURNS:
@@ -300,7 +302,7 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
                 messages.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
                 continue
-            print(f"[step {step}] tool: {name} {json.dumps(args)[:200]}")
+            ui.tool_call(step, name, json.dumps(args))
             if name == "done":
                 final = args.get("summary", "")
                 log(log_path, {"step": step, "tool": name, "args": args, "result": final})
@@ -309,7 +311,7 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
                 result = dispatch(root, name, args)
             except Exception as e:  # surface sandbox errors to the model, don't crash
                 result = f"error: {e}"
-            print(f"  -> {result[:300]}")
+            ui.tool_result(result)
             log(log_path, {"step": step, "tool": name, "args": args, "result": result[:2000]})
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
     return f"stopped: max_steps ({max_steps} steps without done)"
@@ -418,7 +420,7 @@ def main() -> None:
         ap.error(f"{e} (or use --smoke for the no-API check)")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     result = run(task_text, root, args.max_steps, sessions_dir(root) / f"{stamp}.jsonl", parent_id=parent_id_for_header)
-    print(f"\nresult: {result}")
+    ui.final(result)
 
 
 if __name__ == "__main__":
