@@ -107,3 +107,21 @@ def test_run_recovers_from_bad_json(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: seq.pop(0))
     assert agent.run("t", tmp_path, max_steps=4) == "recovered"
+
+
+def test_read_paging(tmp_path):
+    (tmp_path / "big.txt").write_text("\n".join(f"line{i}" for i in range(500)))
+    first = agent.tool_read(tmp_path, "big.txt", 0, 100)
+    assert "lines 1-100 of 500" in first
+    assert "line0" in first
+    assert "offset=100" in first
+    second = agent.tool_read(tmp_path, "big.txt", 100, 100)
+    assert "lines 101-200 of 500" in second
+    assert "line100" in second
+    assert "line99\n" not in second
+    last = agent.tool_read(tmp_path, "big.txt", 498, 100)
+    assert "lines 499-500 of 500" in last
+    assert "offset=" not in last  # no continuation hint on the final page
+    assert "past end" in agent.tool_read(tmp_path, "big.txt", 900, 100)
+    assert "bad_args" in agent.tool_read(tmp_path, "big.txt", "xx", 10)
+    assert "bad_args" in agent.tool_read(tmp_path, "big.txt", 0, "lots")

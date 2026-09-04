@@ -30,8 +30,8 @@ BLOCKED_BASH_PATTERNS = ["rm -rf /", "rm -rf ~", ":(){", "mkfs", "dd of=/dev"]
 TOOLS = [
     {
         "name": "read_file",
-        "description": "Read a UTF-8 text file inside the workspace.",
-        "parameters": {"path": "workspace-relative path, e.g. agent.py"},
+        "description": "Read a UTF-8 text file inside the workspace. Output is paged by lines (default 200); pass offset/limit to read the rest.",
+        "parameters": {"path": "workspace-relative path, e.g. agent.py", "offset": "optional first line, 0-based (default 0)", "limit": "optional max lines (default 200)"},
     },
     {
         "name": "edit_file",
@@ -70,9 +70,30 @@ def truncate(s: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return s[:limit] + f"\n... [truncated {len(s) - limit} chars]"
 
 
-def tool_read(root: Path, path: str) -> str:
+def tool_read(root: Path, path: str, offset: int = 0, limit: int = 200) -> str:
+    try:
+        off = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        return "error: bad_args: 'offset' must be an integer, e.g. {'path': 'agent.py', 'offset': 200}"
+    try:
+        lim = max(1, int(limit or 200))
+    except (TypeError, ValueError):
+        return "error: bad_args: 'limit' must be an integer, e.g. {'path': 'agent.py', 'limit': 200}"
     p = resolve(root, path)
-    return truncate(p.read_text(encoding="utf-8"), MAX_OUTPUT_CHARS)
+    lines = p.read_text(encoding="utf-8").splitlines()
+    total = len(lines)
+    page = lines[off:off + lim]
+    if page:
+        shown = f"lines {off + 1}-{off + len(page)} of {total}"
+    else:
+        shown = f"lines {off + 1}-{off} of {total} (past end)"
+    body = "\n".join(page)
+    if len(body) > MAX_OUTPUT_CHARS:  # very long lines: char-cap the page, keep it recoverable
+        body = body[:MAX_OUTPUT_CHARS] + f"\n... [truncated {len(body) - MAX_OUTPUT_CHARS} chars; re-read with a smaller limit]"
+    out = f"{shown}\n{body}"
+    if off + lim < total:
+        out += f"\n... [more: re-read {path!r} with offset={off + lim} to continue]"
+    return out
 
 
 def tool_edit(root: Path, path: str, find: str, replace: str) -> str:
@@ -127,6 +148,7 @@ def tool_bash(root: Path, command: str, timeout_s: float = DEFAULT_TIMEOUT_S) ->
 SYSTEM = (
     "You are a minimal coding agent. Work inside the workspace only. "
     "Use tools to read before editing, then verify with bash (e.g. pytest -q). "
+    "Large outputs are paged by lines; re-read with offset to continue. "
     "Call done with a short summary when finished. "
     "If a tool returns an error, fix your approach instead of repeating it."
 )
@@ -188,7 +210,7 @@ def dispatch(root: Path, name: str, args: dict) -> str:
     if name == "read_file":
         if not args.get("path"):
             return "error: missing_arg: 'path' is required, e.g. {'path': 'agent.py'}"
-        return tool_read(root, args.get("path", ""))
+        return tool_read(root, args.get("path", ""), args.get("offset", 0), args.get("limit", 200))
     if name == "edit_file":
         for k in ("path", "find", "replace"):
             if k not in args:
@@ -213,6 +235,17 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": task},
     ]
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        header = {
+            "type": "session",
+            "id": log_path.stem,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "task": task,
+            "parent_id": None,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
     seen: dict[tuple, int] = {}  # (tool, canonical args) -> times seen; bounded by repeat limit
     idle_turns = 0
     for step in range(1, max_steps + 1):
@@ -273,7 +306,7 @@ def smoke_test(root: Path) -> None:
     """No-API check: exercises sandbox, edit uniqueness, truncation, bash."""
     demo = root / "smoke_demo.txt"
     demo.write_text("hello\n", encoding="utf-8")
-    assert tool_read(root, "smoke_demo.txt") == "hello\n"
+    assert "hello" in tool_read(root, "smoke_demo.txt")
     try:
         tool_read(root, "../outside.txt")
         raise AssertionError("path traversal should have raised")
@@ -289,14 +322,77 @@ def smoke_test(root: Path) -> None:
     print("smoke ok: sandbox, edit guards, truncation, bash all pass")
 
 
+def list_sessions(root: Path) -> None:
+    """List sessions/*.jsonl files: id, ts, task from header, or (no header)."""
+    candidates: list[Path] = []
+    cwd_sessions = Path("sessions")
+    ws_sessions = root / "sessions"
+    # collect existing dirs first
+    if cwd_sessions.exists():
+        candidates.append(cwd_sessions)
+    if ws_sessions.exists():
+        if not cwd_sessions.exists() or ws_sessions.resolve() != cwd_sessions.resolve():
+            candidates.append(ws_sessions)
+    if not candidates:
+        # fall back to both locations even if they don't exist yet
+        uniq: list[Path] = []
+        seen_dirs: set[Path] = set()
+        for d in [cwd_sessions, ws_sessions]:
+            try:
+                rp = d.resolve()
+            except Exception:
+                rp = d
+            if rp not in seen_dirs:
+                seen_dirs.add(rp)
+                uniq.append(d)
+        candidates = uniq
+
+    seen_files: set[Path] = set()
+    all_files: list[Path] = []
+    for d in candidates:
+        for f in d.glob("*.jsonl"):
+            try:
+                rp = f.resolve()
+            except Exception:
+                rp = f
+            if rp not in seen_files:
+                seen_files.add(rp)
+                all_files.append(f)
+    all_files.sort(key=lambda p: p.name)
+
+    for fp in all_files:
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                first = fh.readline().strip()
+                if not first:
+                    raise ValueError("empty")
+                obj = json.loads(first)
+                if obj.get("type") != "session":
+                    raise ValueError("not session header")
+                sid = obj.get("id") or fp.stem
+                ts = obj.get("ts", "")
+                task = obj.get("task", "")
+                task_one = " ".join(str(task).splitlines()).strip()
+                if task_one:
+                    print(f"{sid} {ts} {task_one}")
+                else:
+                    print(f"{sid} {ts}".rstrip())
+        except Exception:
+            print(f"{fp.stem} (no header)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Mini coding-agent harness")
     ap.add_argument("task", nargs="?", default="", help="task text")
     ap.add_argument("--workspace", default=".", help="workspace root")
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--smoke", action="store_true", help="run no-API smoke test")
+    ap.add_argument("--list", dest="list_flag", action="store_true", help="list sessions/*.jsonl (id, ts, task) and exit")
     args = ap.parse_args()
     root = Path(args.workspace).resolve()
+    if args.list_flag:
+        list_sessions(root)
+        return
     if args.smoke:
         smoke_test(root)
         return
