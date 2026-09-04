@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_OUTPUT_CHARS = 4000
-DEFAULT_MAX_STEPS = 20
+DEFAULT_MAX_STEPS = 30
 DEFAULT_TIMEOUT_S = 30
 MAX_REPEAT_CALLS = 3  # same tool+args this many times -> stop: no_progress
 MAX_IDLE_TURNS = 3  # model replies with no tool call this many times in a row -> stop
@@ -150,6 +150,7 @@ SYSTEM = (
     "Use tools to read before editing, then verify with bash (e.g. pytest -q). "
     "Large outputs are paged by lines; re-read with offset to continue. "
     "Call done with a short summary when finished. "
+    "When the task is verified, call done immediately — do not keep narrating. "
     "If a tool returns an error, fix your approach instead of repeating it."
 )
 
