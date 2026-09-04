@@ -157,7 +157,6 @@ class InputBuffer:
 
 # For input processing tests: maps logical keys to buffer actions.
 # Returns (should_submit, should_exit)
-
 def handle_input_event(buf: InputBuffer, key: str, char: str | None = None) -> tuple[bool, bool]:
     """
     Pure input handling.
@@ -213,6 +212,30 @@ def handle_input_event(buf: InputBuffer, key: str, char: str | None = None) -> t
     else:
         # unknown key — ignore
         return (False, False)
+
+
+def visible_input(prompt: str, text: str, cursor: int, width: int) -> tuple[str, int]:
+    """Pure horizontal-scroll helper for the single-line input box.
+
+    Returns (display, cursor_x): display fits in width, cursor_x is the
+    cursor column within display. The view scrolls so the cursor stays
+    visible; the tail is shown when the cursor is at the end.
+    """
+    prompt = prompt or ""
+    text = text or ""
+    cursor = max(0, min(cursor, len(text)))
+    width = max(1, width)
+    avail = max(1, width - len(prompt) - 1)
+    if len(text) <= avail:
+        start = 0
+    elif cursor < avail:
+        start = 0
+    elif cursor >= len(text):
+        start = len(text) - avail
+    else:
+        start = cursor - avail + 1
+    start = max(0, start)
+    return prompt + text[start:start + avail], len(prompt) + (cursor - start)
 
 
 # ----------------------------------------------------------------------
@@ -492,23 +515,25 @@ class TuiRenderer:
         try:
             import curses
             self._input_win.erase()
-            display = prompt + input_buf.text
-            width = self._width
-            # truncate display if too long, keep cursor visible by showing tail around cursor?
-            # For simplicity, show from max(0, cursor - width + len(prompt) + 5) ?
-            # We'll just truncate to width-1 from start, and clamp cursor.
-            truncated = display[: max(0, width - 1)]
-            self._input_win.addnstr(0, 0, truncated, max(0, width - 1))
-            cursor_x = len(prompt) + input_buf.cursor
-            if cursor_x >= width:
-                cursor_x = width - 1
-            if cursor_x < 0:
-                cursor_x = 0
+            display, cursor_x = visible_input(prompt, input_buf.text, input_buf.cursor, self._width)
+            self._input_win.addnstr(0, 0, display, max(0, self._width - 1))
             try:
-                self._input_win.move(0, cursor_x)
+                self._input_win.move(0, max(0, min(cursor_x, self._width - 1)))
             except curses.error:
                 pass
             self._input_win.noutrefresh()
+            curses.doupdate()
+        except Exception:
+            pass
+
+    def _clear_input(self, prompt: str = "> ") -> None:
+        """Erase the input window after submit so stale text never lingers."""
+        if not self._in_curses or self._input_win is None:
+            return
+        try:
+            self._input_win.erase()
+            self._input_win.noutrefresh()
+            import curses
             curses.doupdate()
         except Exception:
             pass
@@ -574,6 +599,7 @@ class TuiRenderer:
                     self.transcript.append(f"{prompt}{line}")
                     self._scroll_offset = 0
                     self._draw_transcript()
+                    self._clear_input(prompt)
                     return line
                 if wch == "\x04":  # Ctrl-D
                     return None
@@ -605,6 +631,7 @@ class TuiRenderer:
                     line = input_buf.text
                     self.transcript.append(f"{prompt}{line}")
                     self._scroll_offset = 0
+                    self._clear_input(prompt)
                     return line
                 if key == 4:  # Ctrl-D
                     return None

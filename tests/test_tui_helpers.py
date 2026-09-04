@@ -9,6 +9,7 @@ from tui import (
     InputBuffer,
     format_status,
     visible_slice,
+    visible_input,
     clamp_scroll_offset,
     handle_input_event,
     TuiRenderer,
@@ -213,3 +214,30 @@ def test_tuirenderer_protocol_and_state():
     assert r.model_name == "new-model"
     assert r.step_count == 7
     assert r.session_id == "newid"
+
+
+def test_visible_input_fits():
+    display, cx = visible_input("> ", "hi", 2, 20)
+    assert display == "> hi"
+    assert cx == 4
+
+
+def test_visible_input_scrolls_to_cursor_at_end():
+    text = "x" * 50
+    display, cx = visible_input("> ", text, 50, 20)
+    assert len(display) <= 20
+    assert display.endswith("x")
+    assert cx == len(display)  # cursor visible at end
+
+
+def test_visible_input_cursor_midline_stays_visible():
+    text = "a" * 50
+    display, cx = visible_input("> ", text, 25, 20)
+    assert display == "> " + "a" * 17
+    assert cx == 18  # cursor column inside the shown window
+
+
+def test_visible_input_short_text_no_scroll():
+    display, cx = visible_input("> ", "abc", 1, 20)
+    assert display == "> abc"
+    assert cx == len("> ") + 1
