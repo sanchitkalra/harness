@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,13 +58,30 @@ def load_instructions(root: Path) -> str:
     return ""
 
 
-def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None, parent_id: str | None = None) -> str:
+def new_conversation(task: str, root: Path) -> list[dict]:
+    """Build initial messages list with system prompt and optional user task."""
     instr = load_instructions(root)
     sys_content = SYSTEM + (f"\n\nWorkspace instructions:\n{instr}" if instr else "")
     messages: list[dict] = [
         {"role": "system", "content": sys_content},
-        {"role": "user", "content": task},
     ]
+    if task:
+        messages.append({"role": "user", "content": task})
+    return messages
+
+
+def drive(
+    messages: list[dict],
+    root: Path,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    log_path: Path | None = None,
+    parent_id: str | None = None,
+) -> str:
+    """Run the agent step loop over an existing messages list.
+    Mutates messages by appending assistant and tool messages.
+    If log_path is given, writes a session header (task = last user message)
+    and logs each step.
+    """
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -71,17 +89,24 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
             model_name = _model
         except Exception:
             model_name = "unknown"
+        # Derive task for header from last user message, else empty
+        task_for_header = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                task_for_header = m.get("content", "") or ""
+                break
         header = {
             "type": "session",
             "id": log_path.stem,
             "ts": datetime.now(timezone.utc).isoformat(),
-            "task": task,
+            "task": task_for_header,
             "parent_id": parent_id,
             "workspace": str(root),
             "model": model_name,
         }
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(header) + "\n")
+
     seen: dict[tuple, int] = {}  # (tool, canonical args) -> times seen; bounded by repeat limit
     idle_turns = 0
     for step in range(1, max_steps + 1):
@@ -130,6 +155,11 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
             log(log_path, {"step": step, "tool": name, "args": args, "result": result[:2000]})
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
     return f"stopped: max_steps ({max_steps} steps without done)"
+
+
+def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None, parent_id: str | None = None) -> str:
+    messages = new_conversation(task, root)
+    return drive(messages, root, max_steps, log_path, parent_id)
 
 
 def log(path: Path | None, entry: dict) -> None:
@@ -189,6 +219,24 @@ def list_sessions(root: Path) -> None:
             print(f"{fp.stem} (no header)")
 
 
+def _unique_log_path(root: Path) -> Path:
+    """Generate a unique log path using UTC timestamp with microseconds."""
+    sdir = sessions_dir(root)
+    for _ in range(10):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        p = sdir / f"{stamp}.jsonl"
+        if not p.exists():
+            return p
+        time.sleep(0.001)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    p = sdir / f"{stamp}.jsonl"
+    counter = 0
+    while p.exists():
+        counter += 1
+        p = sdir / f"{stamp}-{counter}.jsonl"
+    return p
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Mini coding-agent harness")
     ap.add_argument("task", nargs="?", default="", help="task text")
@@ -197,6 +245,7 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true", help="run no-API smoke test")
     ap.add_argument("--list", dest="list_flag", action="store_true", help="list sessions/*.jsonl (id, ts, task) and exit")
     ap.add_argument("--fork", dest="fork_id", default=None, help="fork from existing session id (root/sessions/<id>.jsonl)")
+    ap.add_argument("-i", "--interactive", dest="interactive", action="store_true", help="interactive REPL mode")
     args = ap.parse_args()
     root = Path(args.workspace).resolve()
     if args.list_flag:
@@ -205,7 +254,7 @@ def main() -> None:
     if args.smoke:
         smoke_test(root)
         return
-    if not args.task:
+    if not args.task and not args.interactive:
         ap.error("give a TASK or pass --smoke")
     parent_id_for_header: str | None = None
     task_text = args.task
@@ -233,6 +282,46 @@ def main() -> None:
         llm_config()
     except RuntimeError as e:
         ap.error(f"{e} (or use --smoke for the no-API check)")
+
+    if args.interactive:
+        messages = new_conversation(task_text, root)
+        prev_id = parent_id_for_header
+        # If initial task_text exists, run it as first turn
+        if task_text:
+            log_path = _unique_log_path(root)
+            try:
+                result = drive(messages, root, args.max_steps, log_path, parent_id=prev_id)
+            except KeyboardInterrupt:
+                print("\n[cancelled]")
+                result = None
+            else:
+                ui.final(result)
+                prev_id = log_path.stem
+
+        while True:
+            try:
+                line = input("> ")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not line.strip():
+                break
+            checkpoint = len(messages)
+            messages.append({"role": "user", "content": line})
+            log_path = _unique_log_path(root)
+            try:
+                result = drive(messages, root, args.max_steps, log_path, parent_id=prev_id)
+            except KeyboardInterrupt:
+                print("\n[cancelled]")
+                del messages[checkpoint:]
+                continue
+            ui.final(result)
+            prev_id = log_path.stem
+        return
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     result = run(task_text, root, args.max_steps, sessions_dir(root) / f"{stamp}.jsonl", parent_id=parent_id_for_header)
     ui.final(result)

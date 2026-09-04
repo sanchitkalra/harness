@@ -478,3 +478,64 @@ def test_ui_error_passthrough_no_color(capsys, monkeypatch):
         out = capsys.readouterr().out
         assert "error:" in out
         assert "something went wrong" in out
+
+
+def test_drive_two_turns_shared_history(tmp_path, monkeypatch):
+    """drive() over two turns sharing one messages list; second turn sees first-turn history."""
+    captured = []
+
+    def fake_llm_call(msgs, tools):
+        # snapshot messages content
+        captured.append([dict(m) for m in msgs])
+        return {"content": "", "tool_calls": [{"id": "c1", "function": {"name": "done", "arguments": '{"summary":"ok"}'}}]}
+
+    monkeypatch.setattr(agent, "llm_call", fake_llm_call)
+    messages = agent.new_conversation("first task", tmp_path)
+    # first turn
+    agent.drive(messages, tmp_path, max_steps=2)
+    assert len(messages) >= 2  # system + user + assistant
+    assert any("first task" in (m.get("content") or "") for m in messages)
+
+    # second turn – append user message as REPL would
+    messages.append({"role": "user", "content": "second task"})
+    agent.drive(messages, tmp_path, max_steps=2)
+
+    assert len(captured) == 2
+    # second captured messages must contain both first and second task in history
+    second_call_text = " ".join(m.get("content", "") for m in captured[1])
+    assert "first task" in second_call_text
+    assert "second task" in second_call_text
+    # second call should be larger than first
+    assert len(captured[1]) > len(captured[0])
+
+
+def test_interactive_bare_eof_exits_without_drive(tmp_path, monkeypatch):
+    """bare -i: input EOF immediately → exits without calling drive."""
+    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    calls = []
+
+    def fake_drive(*a, **k):
+        calls.append(1)
+        return "ok"
+
+    monkeypatch.setattr(agent, "drive", fake_drive)
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i"])
+    agent.main()
+    assert calls == []
+
+
+def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
+    """-i with a task: runs drive once for initial task, then EOF exits."""
+    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    calls = []
+
+    def fake_drive(*a, **k):
+        calls.append(1)
+        return "ok"
+
+    monkeypatch.setattr(agent, "drive", fake_drive)
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i", "do thing"])
+    agent.main()
+    assert len(calls) == 1
