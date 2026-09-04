@@ -9,7 +9,9 @@ from tui import (
     InputBuffer,
     format_status,
     visible_slice,
-    visible_input,
+    wrap_line,
+    wrap_input,
+    summarize_batch,
     clamp_scroll_offset,
     handle_input_event,
     TuiRenderer,
@@ -216,28 +218,85 @@ def test_tuirenderer_protocol_and_state():
     assert r.session_id == "newid"
 
 
-def test_visible_input_fits():
-    display, cx = visible_input("> ", "hi", 2, 20)
-    assert display == "> hi"
-    assert cx == 4
+def test_wrap_line():
+    assert wrap_line("hello world foo", 8) == ["hello ", "world ", "foo"]
+    assert wrap_line("", 10) == [""]
+    assert wrap_line("x" * 25, 10) == ["x" * 10, "x" * 10, "x" * 5]
+    # no content lost across chunks
+    assert "".join(wrap_line("ab cd ef gh", 5)) == "ab cd ef gh"
 
 
-def test_visible_input_scrolls_to_cursor_at_end():
-    text = "x" * 50
-    display, cx = visible_input("> ", text, 50, 20)
-    assert len(display) <= 20
-    assert display.endswith("x")
-    assert cx == len(display)  # cursor visible at end
+def test_wrap_input_single_row():
+    rows, crow, ccol = wrap_input("> ", "hi", 2, 20, 3)
+    assert rows == ["> hi"]
+    assert (crow, ccol) == (0, 4)
 
 
-def test_visible_input_cursor_midline_stays_visible():
-    text = "a" * 50
-    display, cx = visible_input("> ", text, 25, 20)
-    assert display == "> " + "a" * 17
-    assert cx == 18  # cursor column inside the shown window
+def test_wrap_input_long_prompt_wraps_and_tracks_cursor():
+    text = "word " * 20  # 100 chars
+    rows, crow, ccol = wrap_input("> ", text, len(text), 20, 3)
+    assert len(rows) == 3  # scrolled to cursor row
+    assert crow == 2
+    assert rows[-1].strip() == "word"  # tail with cursor visible
+    assert 0 <= ccol <= len(rows[crow])
 
 
-def test_visible_input_short_text_no_scroll():
-    display, cx = visible_input("> ", "abc", 1, 20)
-    assert display == "> abc"
-    assert cx == len("> ") + 1
+def test_wrap_input_midline_cursor():
+    rows, crow, ccol = wrap_input("> ", "abcdefghij", 3, 20, 3)
+    assert rows == ["> abcdefghij"]
+    assert (crow, ccol) == (0, 2 + 3)
+
+
+def test_summarize_batch():
+    text, err = summarize_batch([
+        ("read_file", "a.py", True),
+        ("read_file", "b.py", True),
+        ("bash", "", True),
+        ("bash", "", False),
+    ])
+    assert text == "read 2 files: a.py, b.py · ran 2 commands · 1 error(s)"
+    assert err is True
+    text2, err2 = summarize_batch([("edit_file", "f.py", True)])
+    assert text2 == "edited f.py"
+    assert err2 is False
+
+
+def test_transcript_kinds_and_collapse():
+    from tui import K_OK
+    buf = TranscriptBuffer(max_lines=10)
+    buf.append("Step 1/5 hi", "step")
+    buf.append("tool line", "tool")
+    assert buf.items() == [("step", "Step 1/5 hi"), ("tool", "tool line")]
+    assert buf.lines == ["Step 1/5 hi", "tool line"]  # plain view unchanged
+    buf.collapse_from(1, [(K_OK, "✔ ↳ read a.py")])
+    assert buf.lines == ["Step 1/5 hi", "✔ ↳ read a.py"]
+    assert buf.items()[1][0] == K_OK
+    buf.clear()
+    assert buf.lines == [] and buf.items() == []
+
+
+def test_renderer_collapses_batch_to_summary():
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.step(1, 5, "do things")
+    r.begin_tools(1)
+    r.tool_call(1, "read_file", '{"path": "a.txt"}')
+    r.tool_result("read_file", "lines 1-2 of 2\nhi")
+    r.tool_call(1, "bash", '{"command": "echo hi"}')
+    r.tool_result("bash", "exit=0")
+    r.end_tools()
+    lines = r.transcript.lines
+    assert any(l.startswith("Step 1/5") for l in lines)
+    assert any("↳" in l and "read a.txt" in l and "ran 1 command" in l for l in lines)
+    assert not any("exit=0" in l for l in lines)  # live lines collapsed away
+    assert any("✔" in l for l in lines)
+
+
+def test_renderer_error_summary():
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.begin_tools(1)
+    r.tool_call(1, "bash", '{"command": "rm -rf / x"}')
+    r.tool_result("bash", "error: blocked: nope")
+    r.end_tools()
+    summaries = [l for l in r.transcript.lines if "↳" in l]
+    assert len(summaries) == 1
+    assert "✖" in summaries[0] and "1 error(s)" in summaries[0]

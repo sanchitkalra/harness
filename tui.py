@@ -8,23 +8,139 @@ Curses calls are isolated in TuiRenderer methods; pure helpers are terminal-free
 """
 from __future__ import annotations
 
+import json
 import sys
+import textwrap
 from collections.abc import Iterable
+
+# Line kinds for colored transcript rendering.
+K_STEP = "step"
+K_TOOL = "tool"
+K_OK = "ok"
+K_ERR = "err"
+K_ADD = "add"
+K_DEL = "del"
+K_HUNK = "hunk"
+K_DIM = "dim"
+K_INPUT = "input"
+K_RESULT = "result"
+K_SUMMARY = "summary"
+K_SUMMARY_ERR = "summary_err"
+K_PLAIN = "plain"
+
+# Input box height in rows (soft-wrapped, single logical line).
+INPUT_ROWS = 3
+
+
+def wrap_line(line: str, width: int) -> list[str]:
+    """Pure word-wrap of one line to width. Never returns empty list."""
+    line = (line or "").expandtabs(4)
+    width = max(4, width)
+    chunks = textwrap.wrap(
+        line, width, break_long_words=True, break_on_hyphens=False,
+        drop_whitespace=False, replace_whitespace=False,
+    )
+    return chunks or [""]
+
+
+def wrap_input(prompt: str, text: str, cursor: int, width: int, max_rows: int) -> tuple[list[str], int, int]:
+    """Pure soft-wrap for the input box. Returns (rows, cursor_row, cursor_col),
+    rows scrolled so the cursor row is visible."""
+    prompt = prompt or ""
+    text = text or ""
+    cursor = max(0, min(cursor, len(text)))
+    width = max(8, width)
+    max_rows = max(1, max_rows)
+    full = prompt + text
+    cpos = len(prompt) + cursor
+    rows = wrap_line(full, width)
+    # map absolute cursor pos to (row, col); chunks concatenate back to full
+    pos = 0
+    crow, ccol = len(rows) - 1, len(rows[-1])
+    for i, ch in enumerate(rows):
+        if cpos <= pos + len(ch):
+            crow, ccol = i, cpos - pos
+            break
+        pos += len(ch)
+    if len(rows) > max_rows:
+        start = max(0, min(crow, len(rows) - max_rows))
+        rows = rows[start:start + max_rows]
+        crow -= start
+    return rows, crow, ccol
+
+
+def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
+    """Pure per-step summary. entries = (tool_name, arg_hint, ok).
+    Returns (summary_text, has_error). Mirrors the print renderer's wording."""
+    reads: list[str] = []
+    edits: list[str] = []
+    writes: list[str] = []
+    bashes = 0
+    searches: list[str] = []
+    others: dict[str, int] = {}
+    errors = 0
+    for name, hint, ok in entries:
+        if not ok:
+            errors += 1
+        if name == "read_file":
+            reads.append(hint or "?")
+        elif name == "edit_file":
+            edits.append(hint or "?")
+        elif name == "write_file":
+            writes.append(hint or "?")
+        elif name == "bash":
+            bashes += 1
+        elif name == "web_search":
+            searches.append(hint or "?")
+        elif name == "done":
+            continue
+        else:
+            others[name] = others.get(name, 0) + 1
+
+    def files(word: str, fs: list[str]) -> str:
+        if len(fs) == 1:
+            return f"{word} {fs[0]}"
+        uniq = list(dict.fromkeys(fs))[:4]
+        more = f" +{len(fs) - len(uniq)} more" if len(fs) > 4 else ""
+        return f"{word} {len(fs)} files: {', '.join(uniq)}{more}"
+
+    parts: list[str] = []
+    if reads:
+        parts.append(files("read", reads))
+    if edits:
+        parts.append(files("edited", edits))
+    if writes:
+        parts.append(files("wrote", writes))
+    if bashes:
+        parts.append("ran 1 command" if bashes == 1 else f"ran {bashes} commands")
+    if searches:
+        parts.append(f"searched {searches[0]!r}"[:80] if len(searches) == 1 else f"searched {len(searches)} queries")
+    for k, v in others.items():
+        parts.append(k if v == 1 else f"{k} x{v}")
+    if errors:
+        parts.append(f"{errors} error(s)")
+    return (" · ".join(parts)) or "tools", errors > 0
 
 # ----------------------------------------------------------------------
 # Pure helpers (no curses)
 # ----------------------------------------------------------------------
 
 class TranscriptBuffer:
-    """Bounded transcript buffer — keeps last max_lines lines."""
+    """Bounded transcript buffer — keeps last max_lines lines.
+
+    Each line carries a kind (see K_* constants) for colored rendering.
+    lines/get_visible keep the old plain-string behavior; items/
+    get_visible_items expose (kind, text) tuples.
+    """
 
     def __init__(self, max_lines: int = 2000):
         if max_lines <= 0:
             max_lines = 2000
         self.max_lines = max_lines
         self._lines: list[str] = []
+        self._kinds: list[str] = []
 
-    def append(self, text: str) -> None:
+    def append(self, text: str, kind: str = K_PLAIN) -> None:
         """Append text (may be multiline) as separate lines, then cap."""
         if text is None:
             text = ""
@@ -33,9 +149,24 @@ class TranscriptBuffer:
         parts = text.splitlines() or [""]
         for p in parts:
             self._lines.append(p)
-        # cap to max_lines (keep newest)
+            self._kinds.append(kind)
+        self._cap()
+
+    def _cap(self) -> None:
         if len(self._lines) > self.max_lines:
-            self._lines = self._lines[-self.max_lines :]
+            cut = len(self._lines) - self.max_lines
+            del self._lines[:cut]
+            del self._kinds[:cut]
+
+    def collapse_from(self, start: int, summary: list[tuple[str, str]]) -> None:
+        """Delete lines from start onward, replace with summary (kind, text) items."""
+        start = max(0, start)
+        del self._lines[start:]
+        del self._kinds[start:]
+        for kind, text in summary:
+            self._lines.append(text)
+            self._kinds.append(kind)
+        self._cap()
 
     def extend(self, lines: Iterable[str]) -> None:
         for ln in lines:
@@ -43,10 +174,15 @@ class TranscriptBuffer:
 
     def clear(self) -> None:
         self._lines.clear()
+        self._kinds.clear()
 
     @property
     def lines(self) -> list[str]:
         return list(self._lines)
+
+    def items(self) -> list[tuple[str, str]]:
+        """(kind, text) pairs in order."""
+        return list(zip(self._kinds, self._lines))
 
     def __len__(self) -> int:
         return len(self._lines)
@@ -56,6 +192,17 @@ class TranscriptBuffer:
         scroll_offset = 0 means bottom is visible (auto-scroll). Positive means scrolled up.
         """
         return visible_slice(self._lines, height, scroll_offset)
+
+    def get_visible_items(self, height: int, scroll_offset: int = 0) -> list[tuple[str, str]]:
+        """Kind-annotated version of get_visible."""
+        items = self.items()
+        if height <= 0 or not items:
+            return []
+        total = len(items)
+        max_offset = max(0, total - height)
+        off = min(max(0, scroll_offset), max_offset)
+        start = max(0, total - height - off)
+        return items[start:start + height]
 
 
 def visible_slice(lines: list[str], height: int, scroll_offset: int = 0) -> list[str]:
@@ -214,28 +361,31 @@ def handle_input_event(buf: InputBuffer, key: str, char: str | None = None) -> t
         return (False, False)
 
 
-def visible_input(prompt: str, text: str, cursor: int, width: int) -> tuple[str, int]:
-    """Pure horizontal-scroll helper for the single-line input box.
+def _arg_hint(name: str, args_json: str) -> str:
+    """Pure one-line hint for batch summaries: path/query, else ''."""
+    try:
+        args = json.loads(args_json) if args_json else {}
+    except Exception:
+        return ""
+    if name in ("read_file", "edit_file", "write_file"):
+        return str(args.get("path", ""))
+    if name == "web_search":
+        return str(args.get("query", ""))
+    return ""
 
-    Returns (display, cursor_x): display fits in width, cursor_x is the
-    cursor column within display. The view scrolls so the cursor stays
-    visible; the tail is shown when the cursor is at the end.
-    """
-    prompt = prompt or ""
-    text = text or ""
-    cursor = max(0, min(cursor, len(text)))
-    width = max(1, width)
-    avail = max(1, width - len(prompt) - 1)
-    if len(text) <= avail:
-        start = 0
-    elif cursor < avail:
-        start = 0
-    elif cursor >= len(text):
-        start = len(text) - avail
-    else:
-        start = cursor - avail + 1
-    start = max(0, start)
-    return prompt + text[start:start + avail], len(prompt) + (cursor - start)
+
+def _diff_kind(line: str) -> str:
+    """Pure diff-line classifier for coloring."""
+    s = line.lstrip()
+    if s.startswith("+++") or s.startswith("---"):
+        return K_DIM
+    if s.startswith("@@"):
+        return K_HUNK
+    if s.startswith("+"):
+        return K_ADD
+    if s.startswith("-"):
+        return K_DEL
+    return K_DIM
 
 
 # ----------------------------------------------------------------------
@@ -273,6 +423,9 @@ class TuiRenderer:
         self._height: int = 24
         self._transcript_height: int = max(1, 24 - 2)
         self._did_alt_screen: bool = False
+        self._batch: list[dict] | None = None
+        self._batch_start: int = 0
+        self._attrs: dict[str, int] = {}  # kind -> curses attr, filled in start_curses
 
     # ---- pure state update ----
 
@@ -292,41 +445,56 @@ class TuiRenderer:
 
     def begin_tools(self, step_num: int) -> None:
         self.step_count = step_num
-        # Optional marker; keep light to not clutter
-        self.transcript.append(f"[{step_num}] tools…")
+        self._batch = []
+        self._batch_start = len(self.transcript)
         self._redraw_transcript_if_needed()
         self._redraw_status_if_needed()
 
     def end_tools(self) -> None:
-        # no-op, but could redraw
-        pass
+        batch = self._batch
+        self._batch = None
+        if not batch:
+            return
+        text, has_error = summarize_batch([(e["name"], e["hint"], e["ok"]) for e in batch])
+        marker = "✖" if has_error else "✔"
+        kind = K_SUMMARY_ERR if has_error else K_SUMMARY
+        self.transcript.collapse_from(self._batch_start, [(kind, f"{marker} ↳ {text}")])
+        self._redraw_transcript_if_needed()
 
     def step(self, num: int, total: int, text: str) -> None:
         self.step_count = num
         truncated = (text or "")[:500].replace("\n", " ")
-        self.transcript.append(f"Step {num}/{total} {truncated}")
+        self.transcript.append(f"Step {num}/{total} {truncated}", K_STEP)
         self._redraw_transcript_if_needed()
         self._redraw_status_if_needed()
 
     def tool_call(self, num: int, name: str, args_json: str) -> None:
         truncated = (args_json or "")[:200].replace("\n", " ")
-        self.transcript.append(f"  tool: {name} {truncated}")
+        self.transcript.append(f"  tool: {name} {truncated}", K_TOOL)
+        if self._batch is not None:
+            self._batch.append({"name": name, "hint": _arg_hint(name, args_json), "ok": True, "_open": True})
         self._redraw_transcript_if_needed()
 
     def tool_result(self, tool_name: str, text: str) -> None:
         raw = text or ""
+        is_error = raw.lstrip().startswith("error:")
+        if self._batch is not None:
+            for entry in reversed(self._batch):
+                if entry["name"] == tool_name and entry["_open"]:
+                    entry["_open"] = False
+                    entry["ok"] = not is_error
+                    break
+        kind = K_ERR if is_error else K_OK
         first = raw.splitlines()[0] if raw.splitlines() else ""
-        first = first[:500]
-        self.transcript.append(f"  -> {tool_name}: {first}")
-        # if multiline diff-like, show up to few lines
-        if tool_name in ("edit_file", "write_file"):
-            lines = raw.splitlines()[1:6]  # show a few extra
-            for ln in lines:
-                self.transcript.append(f"     {ln[:800]}")
+        self.transcript.append(f"  -> {tool_name}: {first[:500]}", kind)
+        # a few extra diff lines for edits/writes
+        if tool_name in ("edit_file", "write_file") and not is_error:
+            for ln in raw.splitlines()[1:6]:
+                self.transcript.append(f"     {ln[:800]}", _diff_kind(ln))
         self._redraw_transcript_if_needed()
 
     def final(self, summary: str) -> None:
-        self.transcript.append(f"result: {summary}")
+        self.transcript.append(f"result: {summary}", K_RESULT)
         self._redraw_transcript_if_needed()
 
     # ---- alternate screen helpers ----
@@ -369,6 +537,7 @@ class TuiRenderer:
                 curses.curs_set(1)
             except curses.error:
                 pass
+            self._init_colors()
             self._in_curses = True
             self._setup_windows()
             self._redraw_all()
@@ -436,7 +605,7 @@ class TuiRenderer:
         self._height = h
         self._width = w
         status_h = 1
-        input_h = 1
+        input_h = INPUT_ROWS
         transcript_h = max(1, h - status_h - input_h)
         self._transcript_height = transcript_h
         try:
@@ -475,14 +644,30 @@ class TuiRenderer:
             import curses
             self._transcript_win.erase()
             height = self._transcript_height
-            width = self._width
-            vis = self.transcript.get_visible(height, self._scroll_offset)
-            for idx, line in enumerate(vis):
+            width = max(8, self._width)
+            # wrap first, then take the bottom window (wrapped continuation counts as lines)
+            wrapped: list[tuple[str, str]] = []
+            for kind, line in self.transcript.items():
+                for chunk in wrap_line(line, width - 1):
+                    wrapped.append((kind, chunk))
+            if self._scroll_offset:
+                total = len(wrapped)
+                max_offset = max(0, total - height)
+                off = min(max(0, self._scroll_offset), max_offset)
+                start = max(0, total - height - off)
+                vis = wrapped[start:start + height]
+            else:
+                vis = wrapped[max(0, len(wrapped) - height):]
+            for idx, (kind, chunk) in enumerate(vis):
                 if idx >= height:
                     break
-                truncated = line[: max(0, width - 1)]
                 try:
-                    self._transcript_win.addnstr(idx, 0, truncated, max(0, width - 1))
+                    if kind in (K_SUMMARY, K_SUMMARY_ERR) and len(chunk) >= 2:
+                        marker_attr = self._kind_attr(K_ERR if kind == K_SUMMARY_ERR else K_OK)
+                        self._transcript_win.addnstr(idx, 0, chunk[:2], width - 1, marker_attr)
+                        self._transcript_win.addnstr(idx, 2, chunk[2:], max(0, width - 3), self._kind_attr(kind))
+                    else:
+                        self._transcript_win.addnstr(idx, 0, chunk, width - 1, self._kind_attr(kind))
                 except curses.error:
                     pass
             self._transcript_win.noutrefresh()
@@ -515,10 +700,16 @@ class TuiRenderer:
         try:
             import curses
             self._input_win.erase()
-            display, cursor_x = visible_input(prompt, input_buf.text, input_buf.cursor, self._width)
-            self._input_win.addnstr(0, 0, display, max(0, self._width - 1))
+            rows, crow, ccol = wrap_input(prompt, input_buf.text, input_buf.cursor, self._width, INPUT_ROWS)
+            for i, row in enumerate(rows):
+                if i >= INPUT_ROWS:
+                    break
+                self._input_win.addnstr(i, 0, row, max(0, self._width - 1))
             try:
-                self._input_win.move(0, max(0, min(cursor_x, self._width - 1)))
+                self._input_win.move(
+                    max(0, min(crow, INPUT_ROWS - 1)),
+                    max(0, min(ccol, self._width - 1)),
+                )
             except curses.error:
                 pass
             self._input_win.noutrefresh()
@@ -538,8 +729,49 @@ class TuiRenderer:
         except Exception:
             pass
 
-    # ---- helpers for redraw checks ----
+    def _init_colors(self) -> None:
+        """Set up kind -> attr map. Falls back to bold/dim when colors fail."""
+        self._attrs = {}
+        try:
+            import curses
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+            except curses.error:
+                pass
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_RED, -1)
+            curses.init_pair(3, curses.COLOR_CYAN, -1)
+            green = curses.color_pair(1)
+            red = curses.color_pair(2)
+            cyan = curses.color_pair(3)
+        except Exception:
+            green = red = cyan = 0
+        try:
+            import curses
+            bold, dim = curses.A_BOLD, curses.A_DIM
+        except Exception:
+            bold, dim = 0, 0
+        self._attrs = {
+            K_STEP: bold,
+            K_TOOL: cyan,
+            K_OK: green,
+            K_ERR: red,
+            K_ADD: green,
+            K_DEL: red,
+            K_HUNK: cyan,
+            K_DIM: dim,
+            K_INPUT: bold,
+            K_RESULT: bold,
+            K_SUMMARY: dim,
+            K_SUMMARY_ERR: dim,
+            K_PLAIN: 0,
+        }
 
+    def _kind_attr(self, kind: str) -> int:
+        return self._attrs.get(kind, 0)
+
+    # ---- helpers for redraw checks ----
     def _redraw_transcript_if_needed(self) -> None:
         if self._in_curses:
             # if currently at bottom, keep auto-scroll
@@ -596,7 +828,7 @@ class TuiRenderer:
                 # String keys: check special
                 if wch == "\n" or wch == "\r":
                     line = input_buf.text
-                    self.transcript.append(f"{prompt}{line}")
+                    self.transcript.append(f"> {line}", K_INPUT)
                     self._scroll_offset = 0
                     self._draw_transcript()
                     self._clear_input(prompt)
@@ -629,7 +861,7 @@ class TuiRenderer:
                 key = wch
                 if key in (curses.KEY_ENTER, 10, 13):
                     line = input_buf.text
-                    self.transcript.append(f"{prompt}{line}")
+                    self.transcript.append(f"> {line}", K_INPUT)
                     self._scroll_offset = 0
                     self._clear_input(prompt)
                     return line
