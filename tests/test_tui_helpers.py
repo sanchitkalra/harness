@@ -410,12 +410,10 @@ def test_renderer_edit_block():
     assert kinds["Update(f.py)"] == K_HEAD
     r.end_tools()
     lines = r.transcript.lines
-    # collapse replaces the block with one summary
-    assert sum(1 for l in lines if "↳" in l) == 1
-    assert not any(l.startswith("  -> edit_file") for l in lines)
-    # click restores the styled block
-    assert r.toggle_at_index(next(iter(r._collapsed))) is True
-    assert "Update(f.py)" in r.transcript.lines
+    # edit-only batch: no summary line, block stays put, nothing to toggle
+    assert not any("↳" in l for l in lines)
+    assert r._collapsed == {}
+    assert "Update(f.py)" in lines
 
 
 def test_boxed_input_width_and_kinds():
@@ -435,3 +433,59 @@ def test_boxed_input_empty():
     box = boxed_input("", 20)
     assert len(box) == 3  # top, one empty row, bottom
     assert all(len(t) <= 20 for _, t in box)
+
+
+def test_edits_never_collapse():
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.begin_tools(7)
+    r.tool_call(7, "read_file", '{"path": "a.txt"}')
+    r.tool_result("read_file", "lines 1-1 of 1\nhi")
+    r.tool_call(7, "edit_file", '{"path": "f.py", "find": "a", "replace": "b"}')
+    r.tool_result("edit_file", "ok: edited f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b")
+    r.end_tools()
+    lines = r.transcript.lines
+    # edit block fully present, nothing truncated
+    assert "Update(f.py)" in lines
+    assert any("Added 1 line, removed 1 line" in l for l in lines)
+    assert any(l.strip().endswith("+ b") for l in lines)
+    # summary covers only the read, no [+] on edit content
+    summaries = [l for l in lines if "↳" in l]
+    assert len(summaries) == 1
+    assert "read a.txt" in summaries[0]
+    assert "edited" not in summaries[0]
+    # toggle restores the read lines but leaves the edit block alone
+    idx = next(iter(r._collapsed))
+    assert r.toggle_at_index(idx) is True
+    assert any("lines 1-1" in l for l in r.transcript.lines)
+    assert "Update(f.py)" in r.transcript.lines
+
+
+def test_done_only_batch_leaves_no_summary():
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.begin_tools(3)
+    r.tool_call(3, "done", '{"summary": "x"}')
+    r.end_tools()  # no tool_result for done
+    assert r.transcript.lines == []
+    assert r._collapsed == {}
+
+
+def test_toggle_latest():
+    r = TuiRenderer(model_name="m", session_id="s")
+    assert r.toggle_latest() is False
+    r.begin_tools(1)
+    r.tool_call(1, "bash", '{"command": "echo hi"}')
+    r.tool_result("bash", "exit=0")
+    r.end_tools()
+    assert r.toggle_latest() is True  # expands
+    assert any("exit=0" in l for l in r.transcript.lines)
+    assert r.toggle_latest() is True  # collapses again
+    assert not any("exit=0" in l for l in r.transcript.lines)
+
+
+def test_step_keeps_full_reasoning():
+    r = TuiRenderer(model_name="m", session_id="s")
+    text = "First sentence about plan.\nSecond sentence with details. " + "x" * 600
+    r.step(2, 30, text)
+    joined = "\n".join(r.transcript.lines)
+    assert "First sentence" in joined and "Second sentence" in joined
+    assert "x" * 600 in joined  # no truncation

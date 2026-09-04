@@ -289,7 +289,7 @@ def clamp_scroll_offset(total_lines: int, height: int, offset: int) -> int:
 
 
 def format_status(model_name: str, step_count: int | None = None, session_id: str | None = None) -> str:
-    """Pure status-line formatter: 'model | steps N | session_id'."""
+    """Pure status-line formatter: 'model | steps N | session_id | tab: expand'."""
     model = (model_name or "unknown")
     model = str(model).strip() or "unknown"
     steps = 0
@@ -299,10 +299,8 @@ def format_status(model_name: str, step_count: int | None = None, session_id: st
         except Exception:
             steps = 0
     sid = (session_id or "").strip()
-    if sid:
-        return f"{model} | steps {steps} | {sid}"
-    else:
-        return f"{model} | steps {steps}"
+    base = f"{model} | steps {steps}" + (f" | {sid}" if sid else "")
+    return base + " | tab: expand"
 
 
 class InputBuffer:
@@ -569,14 +567,29 @@ class TuiRenderer:
         self._batch = None
         if not batch:
             return
-        details = self.transcript.items()[self._batch_start:]
-        text, has_error = summarize_batch([(e["name"], e["hint"], e["ok"]) for e in batch])
-        marker = "✖" if has_error else "✔"
-        kind = K_SUMMARY_ERR if has_error else K_SUMMARY
-        summary = f"{marker} ↳ {text}  [+]"
-        self.transcript.collapse_from(self._batch_start, [(kind, summary)])
-        idx = len(self.transcript) - 1  # post-cap index of the summary
-        self._collapsed[idx] = {"text": summary, "details": details, "expanded": False}
+        is_edit = lambda e: e["name"] in ("edit_file", "write_file")
+        others = [e for e in batch if not is_edit(e) and e["name"] != "done"]
+        edits = [e for e in batch if is_edit(e)]
+        out: list[tuple[str, str]] = []
+        collapsed: list[tuple[str, str]] = []
+        if others:
+            text, has_error = summarize_batch([(e["name"], e["hint"], e["ok"]) for e in others])
+            marker = "✖" if has_error else "✔"
+            kind = K_SUMMARY_ERR if has_error else K_SUMMARY
+            out.append((kind, f"{marker} ↳ {text}  [+]"))
+            for e in others:
+                collapsed.extend(e["details"])
+        for e in edits:
+            out.extend(e["details"])
+        if not out:
+            # done-only batch: drop the stray tool line, no summary
+            self.transcript.collapse_from(self._batch_start, [])
+            return
+        self.transcript.collapse_from(self._batch_start, out)
+        if collapsed:
+            idx = len(self.transcript) - len(out)  # summary sits before the edit blocks
+            if 0 <= idx < len(self.transcript) and self.transcript.lines[idx] == out[0][1]:
+                self._collapsed[idx] = {"text": out[0][1], "details": collapsed, "expanded": False}
         self._redraw_transcript_if_needed()
 
     def toggle_at_index(self, i: int) -> bool:
@@ -607,6 +620,12 @@ class TuiRenderer:
         self._redraw_transcript_if_needed()
         return True
 
+    def toggle_latest(self) -> bool:
+        """Expand/collapse the most recent summary (Tab fallback when mouse is absent)."""
+        if not self._collapsed:
+            return False
+        return self.toggle_at_index(max(self._collapsed))
+
     def toggle_at_row(self, y: int) -> bool:
         """Click handler: transcript row y -> buffer index -> toggle."""
         if y < 0 or y >= len(self._last_drawn):
@@ -618,8 +637,7 @@ class TuiRenderer:
 
     def step(self, num: int, total: int, text: str) -> None:
         self.step_count = num
-        truncated = (text or "")[:500].replace("\n", " ")
-        self.transcript.append(f"Step {num}/{total} {truncated}", K_STEP)
+        self.transcript.append(f"Step {num}/{total} {(text or '').strip()}", K_STEP)
         self._redraw_transcript_if_needed()
         self._redraw_status_if_needed()
 
@@ -627,17 +645,26 @@ class TuiRenderer:
         truncated = (args_json or "")[:200].replace("\n", " ")
         self.transcript.append(f"  tool: {name} {truncated}", K_TOOL)
         if self._batch is not None:
-            self._batch.append({"name": name, "hint": _arg_hint(name, args_json), "ok": True, "_open": True})
+            self._batch.append({
+                "name": name,
+                "hint": _arg_hint(name, args_json),
+                "ok": True,
+                "_open": True,
+                "_start": len(self.transcript),
+                "details": [],
+            })
         self._redraw_transcript_if_needed()
 
     def tool_result(self, tool_name: str, text: str) -> None:
         raw = text or ""
         is_error = raw.lstrip().startswith("error:")
+        matched = None
         if self._batch is not None:
             for entry in reversed(self._batch):
                 if entry["name"] == tool_name and entry["_open"]:
                     entry["_open"] = False
                     entry["ok"] = not is_error
+                    matched = entry
                     break
         kind = K_ERR if is_error else K_OK
         if tool_name in ("edit_file", "write_file") and not is_error:
@@ -653,6 +680,8 @@ class TuiRenderer:
         else:
             first = raw.splitlines()[0] if raw.splitlines() else ""
             self.transcript.append(f"  -> {tool_name}: {first[:500]}", kind)
+        if matched is not None:
+            matched["details"] = self.transcript.items()[matched["_start"]:]
         self._redraw_transcript_if_needed()
 
     def final(self, summary: str) -> None:
@@ -1014,6 +1043,12 @@ class TuiRenderer:
             # wch can be str or int
             if isinstance(wch, str):
                 # String keys: check special
+                if wch == "\t" and not input_buf.text:
+                    # Tab on empty input toggles the latest summary (mouse fallback)
+                    if self.toggle_latest():
+                        self._draw_transcript()
+                        self._draw_input(input_buf, prompt)
+                    continue
                 if wch == "\n" or wch == "\r":
                     line = input_buf.text
                     self.transcript.extend_items(boxed_input(line, max(12, self._width)))
@@ -1053,11 +1088,19 @@ class TuiRenderer:
                     except Exception:
                         continue
                     try:
-                        clicked = bool(bstate & curses.BUTTON1_CLICKED)
+                        press = curses.BUTTON1_PRESSED
+                        click = curses.BUTTON1_CLICKED
+                        release = curses.BUTTON1_RELEASED
                     except Exception:
-                        clicked = True
-                    if clicked and my < self._transcript_height:
-                        self.toggle_at_row(my)
+                        press = click = release = 0
+                    if (bstate & (press | click | release)) or not (press | click | release):
+                        if my < self._transcript_height:
+                            self.toggle_at_row(my)
+                            self._draw_transcript()
+                            self._draw_input(input_buf, prompt)
+                    continue
+                if key == 9 and not input_buf.text:  # Tab fallback (getch path)
+                    if self.toggle_latest():
                         self._draw_transcript()
                         self._draw_input(input_buf, prompt)
                     continue
