@@ -243,7 +243,7 @@ def dispatch(root: Path, name: str, args: dict) -> str:
     return f"error: unknown_tool: {name!r} is not a tool; valid tools are: {valid}"
 
 
-def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None) -> str:
+def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None, parent_id: str | None = None) -> str:
     instr = load_instructions(root)
     sys_content = SYSTEM + (f"\n\nWorkspace instructions:\n{instr}" if instr else "")
     messages: list[dict] = [
@@ -262,7 +262,7 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
             "id": log_path.stem,
             "ts": datetime.now(timezone.utc).isoformat(),
             "task": task,
-            "parent_id": None,
+            "parent_id": parent_id,
             "workspace": str(root),
             "model": model_name,
         }
@@ -379,6 +379,7 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--smoke", action="store_true", help="run no-API smoke test")
     ap.add_argument("--list", dest="list_flag", action="store_true", help="list sessions/*.jsonl (id, ts, task) and exit")
+    ap.add_argument("--fork", dest="fork_id", default=None, help="fork from existing session id (root/sessions/<id>.jsonl)")
     args = ap.parse_args()
     root = Path(args.workspace).resolve()
     if args.list_flag:
@@ -389,12 +390,34 @@ def main() -> None:
         return
     if not args.task:
         ap.error("give a TASK or pass --smoke")
+    parent_id_for_header: str | None = None
+    task_text = args.task
+    if args.fork_id is not None:
+        parent_file = sessions_dir(root) / f"{args.fork_id}.jsonl"
+        if not parent_file.is_file():
+            ap.error(f"fork: parent session file not found: {parent_file} (id {args.fork_id!r})")
+        try:
+            first_line = parent_file.read_text(encoding="utf-8").splitlines()[0].strip()
+            parent_header = json.loads(first_line)
+            if parent_header.get("type") != "session":
+                raise ValueError("header type is not 'session'")
+        except Exception as e:
+            ap.error(f"fork: parent session header missing or invalid in {parent_file}: {e}")
+        parent_id_for_header = parent_header.get("id") or args.fork_id
+        parent_task = parent_header.get("task", "")
+        try:
+            all_lines = [ln for ln in parent_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            step_count = max(0, len(all_lines) - 1)
+        except Exception:
+            step_count = 0
+        context_line = f"Forked from session {parent_id_for_header}: task={parent_task!r} steps={step_count}"
+        task_text = context_line + "\n" + task_text
     try:
         llm_config()
     except RuntimeError as e:
         ap.error(f"{e} (or use --smoke for the no-API check)")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    result = run(args.task, root, args.max_steps, sessions_dir(root) / f"{stamp}.jsonl")
+    result = run(task_text, root, args.max_steps, sessions_dir(root) / f"{stamp}.jsonl", parent_id=parent_id_for_header)
     print(f"\nresult: {result}")
 
 

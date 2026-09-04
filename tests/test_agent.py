@@ -201,3 +201,48 @@ def test_sessions_dir_and_list(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "a 2020-01-01T00:00:00+00:00 hello" in out
     assert "bad (no header)" in out
+
+
+def test_fork_parent_id_in_header(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("MODEL_API_KEY", "k")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "child ok"}))
+    sdir = agent.sessions_dir(tmp_path)
+    # create parent session with 2 extra steps
+    parent_id = "parent123"
+    (sdir / f"{parent_id}.jsonl").write_text(
+        '{"type":"session","id":"parent123","ts":"2020-01-01T00:00:00+00:00","task":"parent task"}\n'
+        '{"step":1,"tool":"bash"}\n'
+        '{"step":2,"tool":"write_file"}\n'
+    )
+    child_path = sdir / "child.jsonl"
+    result = agent.run("new task", tmp_path, max_steps=2, log_path=child_path, parent_id=parent_id)
+    assert result == "child ok"
+    header = json.loads(child_path.read_text(encoding="utf-8").splitlines()[0])
+    assert header["parent_id"] == parent_id
+    assert header["task"] == "new task"
+
+
+def test_main_fork_cli(tmp_path, monkeypatch, capsys):
+    import json
+    sdir = agent.sessions_dir(tmp_path)
+    parent_id = "20200101-000000"
+    (sdir / f"{parent_id}.jsonl").write_text(
+        '{"type":"session","id":"20200101-000000","ts":"2020-01-01T00:00:00+00:00","task":"do parent thing"}\n'
+        '{"step":1}\n{"step":2}\n'
+    )
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "forked ok"}))
+    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "--fork", parent_id, "continue work"])
+    agent.main()
+    # find child session (different from parent)
+    files = [p for p in sdir.glob("*.jsonl") if p.stem != parent_id]
+    assert len(files) == 1
+    header = json.loads(files[0].read_text(encoding="utf-8").splitlines()[0])
+    assert header["parent_id"] == parent_id
+    assert "Forked from session" in header["task"]
+    assert parent_id in header["task"]
+    assert "do parent thing" in header["task"]
+    assert "steps=2" in header["task"] or "step count" in header["task"].lower() or "2" in header["task"]
+    assert "continue work" in header["task"]
