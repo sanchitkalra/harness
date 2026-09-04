@@ -539,3 +539,26 @@ def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i", "do thing"])
     agent.main()
     assert len(calls) == 1
+
+
+def test_load_memory_missing(tmp_path):
+    assert agent.load_memory(tmp_path) == ""
+
+
+def test_load_memory_in_system_prompt(tmp_path):
+    (tmp_path / "MEMORY.md").write_text("durable fact: cats", encoding="utf-8")
+    msgs = agent.new_conversation("hello", tmp_path)
+    sys_msg = msgs[0]["content"]
+    assert "Long-term memory" in sys_msg
+    assert "durable fact: cats" in sys_msg
+
+
+def test_load_memory_truncation(tmp_path):
+    long_text = "x" * 5000
+    (tmp_path / "MEMORY.md").write_text(long_text, encoding="utf-8")
+    mem = agent.load_memory(tmp_path)
+    assert len(mem) == 2000
+    assert mem == long_text[:2000]
+    msgs = agent.new_conversation("hi", tmp_path)
+    assert long_text[:2000] in msgs[0]["content"]
+    assert long_text[2000:] not in msgs[0]["content"]

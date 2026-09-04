@@ -42,7 +42,8 @@ SYSTEM = (
     "Large outputs are paged by lines; re-read with offset to continue. "
     "Call done with a short summary when finished. "
     "When the task is verified, call done immediately — do not keep narrating. "
-    "If a tool returns an error, fix your approach instead of repeating it."
+    "If a tool returns an error, fix your approach instead of repeating it. "
+    "You may update MEMORY.md via edit_file/write_file to persist durable facts across sessions."
 )
 
 
@@ -58,10 +59,24 @@ def load_instructions(root: Path) -> str:
     return ""
 
 
+def load_memory(root: Path) -> str:
+    p = root / "MEMORY.md"
+    try:
+        if p.is_file():
+            text = p.read_text(encoding="utf-8")
+            return text[:2000]
+    except Exception:
+        pass
+    return ""
+
+
 def new_conversation(task: str, root: Path) -> list[dict]:
     """Build initial messages list with system prompt and optional user task."""
     instr = load_instructions(root)
+    mem = load_memory(root)
     sys_content = SYSTEM + (f"\n\nWorkspace instructions:\n{instr}" if instr else "")
+    if mem:
+        sys_content += f"\n\nLong-term memory:\n{mem}"
     messages: list[dict] = [
         {"role": "system", "content": sys_content},
     ]
