@@ -246,3 +246,61 @@ def test_main_fork_cli(tmp_path, monkeypatch, capsys):
     assert "do parent thing" in header["task"]
     assert "steps=2" in header["task"] or "step count" in header["task"].lower() or "2" in header["task"]
     assert "continue work" in header["task"]
+
+def test_web_search_success_and_truncation(tmp_path, monkeypatch):
+    import json as _json
+    import urllib.request as _urllib_req
+
+    payload = {
+        "query": {
+            "search": [
+                {"title": "Python (programming language)", "snippet": 'Python is <span class="searchmatch">great</span>'},
+                {"title": "Monty Python", "snippet": "comedy group"},
+            ]
+        }
+    }
+    raw = _json.dumps(payload).encode()
+
+    class FakeResp:
+        def __init__(self, data):
+            self._data = data
+        def read(self):
+            return self._data
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=15):
+        # check User-Agent present
+        assert req.get_header("User-agent") or req.headers.get("User-Agent")
+        return FakeResp(raw)
+
+    monkeypatch.setattr(_urllib_req, "urlopen", fake_urlopen)
+
+    out = agent.tool_search(tmp_path, "python", 2)
+    assert "Python (programming language)" in out
+    assert "Monty Python" in out
+    assert "great" in out  # html stripped
+    assert "https://en.wikipedia.org/wiki/" in out
+    assert "<span" not in out
+
+
+def test_web_search_network_failure(tmp_path, monkeypatch):
+    import urllib.request as _urllib_req
+
+    def fake_urlopen_fail(req, timeout=15):
+        raise OSError("network down")
+
+    monkeypatch.setattr(_urllib_req, "urlopen", fake_urlopen_fail)
+    out = agent.tool_search(tmp_path, "python", 5)
+    assert out.startswith("error:")
+    assert "network" in out.lower() or "failure" in out.lower()
+
+
+def test_web_search_dispatch_bad_args(tmp_path):
+    # missing query arg -> error via dispatch
+    assert "missing_arg" in agent.dispatch(tmp_path, "web_search", {})
+    assert "missing_arg" in agent.dispatch(tmp_path, "web_search", {"query": "   "})
+    # bad limit
+    assert "bad_args" in agent.dispatch(tmp_path, "web_search", {"query": "hi", "limit": "notanint"})

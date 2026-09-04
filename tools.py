@@ -5,7 +5,13 @@ rejects anything escaping the workspace root.
 """
 from __future__ import annotations
 
+import html
+import json
+import re
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 MAX_OUTPUT_CHARS = 4000
@@ -32,6 +38,11 @@ TOOLS = [
         "name": "bash",
         "description": "Run a shell command with cwd=workspace. Returns exit code, stdout, stderr.",
         "parameters": {"command": "e.g. pytest -q", "timeout_s": "optional seconds (default 30)"},
+    },
+    {
+        "name": "web_search",
+        "description": "Search Wikipedia for articles matching a query. Returns title, snippet, and article URL.",
+        "parameters": {"query": "search terms, e.g. 'python programming'", "limit": "optional max results (default 5)"},
     },
     {
         "name": "done",
@@ -130,6 +141,51 @@ def tool_bash(root: Path, command: str, timeout_s: float = DEFAULT_TIMEOUT_S) ->
     return truncate(out)
 
 
+def tool_search(root: Path, query: str, limit: int = 5) -> str:
+    if not (query or "").strip():
+        return "error: missing_arg: 'query' is required, e.g. {'query': 'python programming'}"
+    try:
+        lim = int(limit) if limit is not None else 5
+    except (TypeError, ValueError):
+        return "error: bad_args: 'limit' must be an integer, e.g. {'query': 'python', 'limit': 5}"
+    lim = max(1, min(lim, 50))
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": str(lim),
+        "format": "json",
+    }
+    url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "mini-agent/1.0 (https://example.com; educational)"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"error: network failure: {e}"
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        return f"error: parse failure: {e}"
+    try:
+        results = data.get("query", {}).get("search", [])
+    except Exception:
+        results = []
+    if not results:
+        return truncate("no results")
+    lines: list[str] = []
+    for r in results:
+        title = r.get("title", "")
+        snippet_html = r.get("snippet", "")
+        # strip html tags from snippet
+        snippet_text = re.sub(r"<[^>]+>", "", snippet_html)
+        snippet_text = html.unescape(snippet_text)
+        article_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+        lines.append(f"Title: {title}\nSnippet: {snippet_text}\nURL: {article_url}")
+    out = "\n\n".join(lines)
+    return truncate(out)
+
+
 def dispatch(root: Path, name: str, args: dict) -> str:
     if name == "read_file":
         if not args.get("path"):
@@ -148,6 +204,10 @@ def dispatch(root: Path, name: str, args: dict) -> str:
         if "command" not in args:
             return "error: missing_arg: 'command' is required, e.g. {'command': 'pytest -q'}"
         return tool_bash(root, args.get("command", ""), float(args.get("timeout_s") or DEFAULT_TIMEOUT_S))
+    if name == "web_search":
+        if "query" not in args or not str(args.get("query", "")).strip():
+            return "error: missing_arg: 'query' is required, e.g. {'query': 'python programming'}"
+        return tool_search(root, args.get("query", ""), args.get("limit", 5))
     if name == "done":
         return "done"
     valid = ", ".join(t["name"] for t in TOOLS)

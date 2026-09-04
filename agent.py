@@ -25,6 +25,7 @@ from tools import (  # re-exported: tests and callers keep working via agent.*
     tool_bash,
     tool_edit,
     tool_read,
+    tool_search,
     tool_write,
     truncate,
 )
