@@ -416,3 +416,22 @@ def test_renderer_edit_block():
     # click restores the styled block
     assert r.toggle_at_index(next(iter(r._collapsed))) is True
     assert "Update(f.py)" in r.transcript.lines
+
+
+def test_boxed_input_width_and_kinds():
+    from tui import boxed_input, K_DIM, K_INPUT
+    box = boxed_input("hello world foo bar", 20)
+    assert all(len(t) <= 20 for _, t in box)
+    assert box[0] == (K_DIM, "┌" + "─" * 18 + "┐")
+    assert box[-1] == (K_DIM, "└" + "─" * 18 + "┘")
+    assert all(k == K_INPUT for k, _ in box[1:-1])
+    # content preserved across wrapped rows
+    inner = "".join(t[2:-2].rstrip() for _, t in box[1:-1]).replace("  ", " ")
+    assert "hello" in inner and "bar" in inner
+
+
+def test_boxed_input_empty():
+    from tui import boxed_input
+    box = boxed_input("", 20)
+    assert len(box) == 3  # top, one empty row, bottom
+    assert all(len(t) <= 20 for _, t in box)

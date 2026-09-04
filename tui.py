@@ -131,6 +131,26 @@ def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
         parts.append(f"{errors} error(s)")
     return (" · ".join(parts)) or "tools", errors > 0
 
+
+def boxed_input(text: str, width: int) -> list[tuple[str, str]]:
+    """Pure grey-boxed rendering of a sent user message.
+
+    Returns (kind, text) lines forming a ┌─┐ box that fits in width.
+    Borders are K_DIM (grey), content is K_INPUT. Content wraps.
+    """
+    width = max(12, width)
+    inner = width - 4  # "│ " + " │"
+    chunks: list[str] = []
+    for para in (text or "").splitlines() or [""]:
+        chunks.extend(wrap_line(para, inner) or [""])
+    top = "┌" + "─" * (inner + 2) + "┐"
+    bottom = "└" + "─" * (inner + 2) + "┘"
+    out: list[tuple[str, str]] = [(K_DIM, top)]
+    for ch in chunks:
+        out.append((K_INPUT, f"│ {ch.ljust(inner)} │"))
+    out.append((K_DIM, bottom))
+    return out
+
 # ----------------------------------------------------------------------
 # Pure helpers (no curses)
 # ----------------------------------------------------------------------
@@ -199,6 +219,11 @@ class TranscriptBuffer:
     def extend(self, lines: Iterable[str]) -> None:
         for ln in lines:
             self.append(ln)
+
+    def extend_items(self, items: Iterable[tuple[str, str]]) -> None:
+        """Append (kind, text) items (may be multiline)."""
+        for kind, text in items:
+            self.append(text, kind)
 
     def clear(self) -> None:
         self._lines.clear()
@@ -991,7 +1016,7 @@ class TuiRenderer:
                 # String keys: check special
                 if wch == "\n" or wch == "\r":
                     line = input_buf.text
-                    self.transcript.append(f"> {line}", K_INPUT)
+                    self.transcript.extend_items(boxed_input(line, max(12, self._width)))
                     self._scroll_offset = 0
                     self._draw_transcript()
                     self._clear_input(prompt)
@@ -1038,7 +1063,7 @@ class TuiRenderer:
                     continue
                 if key in (curses.KEY_ENTER, 10, 13):
                     line = input_buf.text
-                    self.transcript.append(f"> {line}", K_INPUT)
+                    self.transcript.extend_items(boxed_input(line, max(12, self._width)))
                     self._scroll_offset = 0
                     self._clear_input(prompt)
                     return line

@@ -132,9 +132,9 @@ def drive(
         try:
             msg = llm_call(messages, TOOLS)
         except ApiError as e:
-            return f"stopped: api ({e}, {step}/{max_steps} steps)"
+            return _stop(log_path, step, f"stopped: api ({e}, {step}/{max_steps} steps)")
         except NetworkError as e:  # network down even after retries: stop, don't crash
-            return f"stopped: network ({e}, {step}/{max_steps} steps)"
+            return _stop(log_path, step, f"stopped: network ({e}, {step}/{max_steps} steps)")
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
@@ -143,7 +143,7 @@ def drive(
         if not calls:  # model talked without acting: nudge it back to tools
             idle_turns += 1
             if idle_turns >= MAX_IDLE_TURNS:
-                return f"stopped: idle (no tool call for {idle_turns} turns, {step}/{max_steps} steps)"
+                return _stop(log_path, step, f"stopped: idle (no tool call for {idle_turns} turns, {step}/{max_steps} steps)")
             messages.append({"role": "user", "content": "Continue: call a tool or done."})
             continue
         idle_turns = 0
@@ -161,7 +161,7 @@ def drive(
                 seen[key] = seen.get(key, 0) + 1
                 if seen[key] > 1:  # repeat: warn, and stop if it keeps going nowhere
                     if seen[key] >= MAX_REPEAT_CALLS:
-                        return f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)"
+                        return _stop(log_path, step, f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)")
                     messages.append({"role": "tool", "tool_call_id": c["id"],
                                      "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
                     continue
@@ -180,7 +180,13 @@ def drive(
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         finally:
             renderer.end_tools()
-    return f"stopped: max_steps ({max_steps} steps without done)"
+    return _stop(log_path, max_steps, f"stopped: max_steps ({max_steps} steps without done)")
+
+
+def _stop(log_path: Path | None, step: int, msg: str) -> str:
+    """Log a terminal outcome so failures leave a trace, then return it."""
+    log(log_path, {"step": step, "tool": "stopped", "args": {}, "result": msg})
+    return msg
 
 
 def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None, parent_id: str | None = None) -> str:

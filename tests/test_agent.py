@@ -598,3 +598,18 @@ def test_drive_returns_stopped_api_on_api_error(tmp_path, monkeypatch):
     out = agent.drive(messages, tmp_path, max_steps=3)
     assert out.startswith("stopped: api")
     assert "401" in out or "Unauthorized" in out
+
+
+def test_stopped_outcomes_logged(tmp_path, monkeypatch):
+    import json
+    def raise_api(*a, **k):
+        raise agent.ApiError(400, "Bad Request", "detail")
+    monkeypatch.setattr(agent, "llm_call", raise_api)
+    log_path = tmp_path / "s.jsonl"
+    out = agent.run("t", tmp_path, max_steps=3, log_path=log_path)
+    assert out.startswith("stopped: api")
+    entries = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    assert entries[0]["type"] == "session"
+    last = entries[-1]
+    assert last["tool"] == "stopped"
+    assert last["result"].startswith("stopped: api")
