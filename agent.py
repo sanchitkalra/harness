@@ -91,6 +91,7 @@ def drive(
     max_steps: int = DEFAULT_MAX_STEPS,
     log_path: Path | None = None,
     parent_id: str | None = None,
+    renderer: ui.Renderer | None = None,
 ) -> str:
     """Run the agent step loop over an existing messages list.
     Mutates messages by appending assistant and tool messages.
@@ -122,6 +123,9 @@ def drive(
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(header) + "\n")
 
+    if renderer is None:
+        renderer = ui.PrintRenderer()
+
     seen: dict[tuple, int] = {}  # (tool, canonical args) -> times seen; bounded by repeat limit
     idle_turns = 0
     for step in range(1, max_steps + 1):
@@ -133,7 +137,7 @@ def drive(
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
         if text:
-            ui.step(step, max_steps, text)
+            renderer.step(step, max_steps, text)
         if not calls:  # model talked without acting: nudge it back to tools
             idle_turns += 1
             if idle_turns >= MAX_IDLE_TURNS:
@@ -141,7 +145,7 @@ def drive(
             messages.append({"role": "user", "content": "Continue: call a tool or done."})
             continue
         idle_turns = 0
-        ui.begin_tools(step)
+        renderer.begin_tools(step)
         try:
             for c in calls:
                 name = c["function"]["name"]
@@ -159,21 +163,21 @@ def drive(
                     messages.append({"role": "tool", "tool_call_id": c["id"],
                                      "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
                     continue
-                ui.tool_call(step, name, json.dumps(args))
+                renderer.tool_call(step, name, json.dumps(args))
                 if name == "done":
                     final = args.get("summary", "")
                     log(log_path, {"step": step, "tool": name, "args": args, "result": final})
-                    ui.end_tools()
+                    renderer.end_tools()
                     return final
                 try:
                     result = dispatch(root, name, args)
                 except Exception as e:  # surface sandbox errors to the model, don't crash
                     result = f"error: {e}"
-                ui.tool_result(name, result)
+                renderer.tool_result(name, result)
                 log(log_path, {"step": step, "tool": name, "args": args, "result": result[:2000]})
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         finally:
-            ui.end_tools()
+            renderer.end_tools()
     return f"stopped: max_steps ({max_steps} steps without done)"
 
 
