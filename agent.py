@@ -270,6 +270,7 @@ def main() -> None:
     ap.add_argument("--list", dest="list_flag", action="store_true", help="list sessions/*.jsonl (id, ts, task) and exit")
     ap.add_argument("--fork", dest="fork_id", default=None, help="fork from existing session id (root/sessions/<id>.jsonl)")
     ap.add_argument("-i", "--interactive", dest="interactive", action="store_true", help="interactive REPL mode")
+    ap.add_argument("--no-tui", dest="no_tui", action="store_true", help="disable curses TUI in interactive mode")
     args = ap.parse_args()
     root = Path(args.workspace).resolve()
     if args.list_flag:
@@ -308,42 +309,125 @@ def main() -> None:
         ap.error(f"{e} (or use --smoke for the no-API check)")
 
     if args.interactive:
+        # Decide renderer: TuiRenderer when TTY and not --no-tui, else PrintRenderer (keep print behavior)
+        use_tui = False
+        tui_renderer = None
+        if not args.no_tui:
+            try:
+                if sys.stdout.isatty():
+                    use_tui = True
+            except Exception:
+                use_tui = False
+
+        if use_tui:
+            try:
+                import tui as tui_mod  # local
+                # model name for status bar
+                try:
+                    _, model_name, _ = llm_config()
+                except Exception:
+                    model_name = "unknown"
+                tui_renderer = tui_mod.TuiRenderer(model_name=model_name, session_id=parent_id_for_header or "")
+                tui_renderer.start_curses()
+            except Exception:
+                # fallback to non-TUI if curses init fails
+                if tui_renderer is not None:
+                    try:
+                        tui_renderer.stop_curses()
+                    except Exception:
+                        pass
+                use_tui = False
+                tui_renderer = None
+
+        # default print renderer when no TUI
+        if tui_renderer is None:
+            default_renderer = ui.PrintRenderer()
+        else:
+            default_renderer = tui_renderer  # type: ignore
+
+        def get_input_line(prompt: str = "> ") -> str | None:
+            if use_tui and tui_renderer is not None:
+                return tui_renderer.read_line(prompt)
+            try:
+                return input(prompt)
+            except EOFError:
+                return None
+            # KeyboardInterrupt propagates to the outer handler (continue).
+
+        def show_final(r: str | None) -> None:
+            if r is None:
+                return
+            if use_tui and tui_renderer is not None:
+                tui_renderer.final(r)
+            else:
+                ui.final(r)
+
+        def run_drive_with_renderer(msgs: list[dict], lpath: Path, pid: str | None, rend) -> str | None:
+            try:
+                return drive(msgs, root, args.max_steps, lpath, parent_id=pid, renderer=rend)
+            except KeyboardInterrupt:
+                if use_tui and tui_renderer is not None:
+                    tui_renderer.transcript.append("[cancelled]")
+                else:
+                    print("\n[cancelled]")
+                return None
+
         messages = new_conversation(task_text, root)
         prev_id = parent_id_for_header
         # If initial task_text exists, run it as first turn
         if task_text:
             log_path = _unique_log_path(root)
-            try:
-                result = drive(messages, root, args.max_steps, log_path, parent_id=prev_id)
-            except KeyboardInterrupt:
-                print("\n[cancelled]")
-                result = None
-            else:
-                ui.final(result)
+            # keep session id in status bar
+            if use_tui and tui_renderer is not None:
+                tui_renderer.update_status(session_id=log_path.stem)
+            result = run_drive_with_renderer(messages, log_path, prev_id, default_renderer)
+            if result is not None:
+                show_final(result)
                 prev_id = log_path.stem
+                if use_tui and tui_renderer is not None:
+                    tui_renderer.update_status(session_id=prev_id)
 
         while True:
             try:
-                line = input("> ")
-            except EOFError:
-                print()
-                break
+                line = get_input_line("> ")
             except KeyboardInterrupt:
-                print()
+                if not use_tui:
+                    print()
                 continue
-            if not line.strip():
+            if line is None:
+                if not use_tui:
+                    print()
                 break
+            if not line.strip():
+                if not use_tui:
+                    # original behavior: empty breaks outer loop
+                    break
+                else:
+                    # in TUI empty input should not exit? keep same as original? spec says Enter sends.
+                    # We'll treat empty as no-op in TUI and continue
+                    # But if user wants to exit empty, they can Ctrl-D.
+                    # For parity with original spec: empty should NOT break in TUI? Let's treat empty as skip.
+                    continue
             checkpoint = len(messages)
             messages.append({"role": "user", "content": line})
             log_path = _unique_log_path(root)
-            try:
-                result = drive(messages, root, args.max_steps, log_path, parent_id=prev_id)
-            except KeyboardInterrupt:
-                print("\n[cancelled]")
+            if use_tui and tui_renderer is not None:
+                tui_renderer.update_status(session_id=log_path.stem)
+            result = run_drive_with_renderer(messages, log_path, prev_id, default_renderer)
+            if result is None:
+                # cancelled via KeyboardInterrupt inside drive — pop message
                 del messages[checkpoint:]
                 continue
-            ui.final(result)
+            show_final(result)
             prev_id = log_path.stem
+            if use_tui and tui_renderer is not None:
+                tui_renderer.update_status(session_id=prev_id)
+
+        if use_tui and tui_renderer is not None:
+            try:
+                tui_renderer.stop_curses()
+            except Exception:
+                pass
         return
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
