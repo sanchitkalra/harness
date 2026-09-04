@@ -237,12 +237,19 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
     ]
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _base, _model, _key = llm_config()
+            model_name = _model
+        except Exception:
+            model_name = "unknown"
         header = {
             "type": "session",
             "id": log_path.stem,
             "ts": datetime.now(timezone.utc).isoformat(),
             "task": task,
             "parent_id": None,
+            "workspace": str(root),
+            "model": model_name,
         }
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(header) + "\n")
@@ -322,61 +329,30 @@ def smoke_test(root: Path) -> None:
     print("smoke ok: sandbox, edit guards, truncation, bash all pass")
 
 
+def sessions_dir(root: Path) -> Path:
+    d = root / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def list_sessions(root: Path) -> None:
     """List sessions/*.jsonl files: id, ts, task from header, or (no header)."""
-    candidates: list[Path] = []
-    cwd_sessions = Path("sessions")
-    ws_sessions = root / "sessions"
-    # collect existing dirs first
-    if cwd_sessions.exists():
-        candidates.append(cwd_sessions)
-    if ws_sessions.exists():
-        if not cwd_sessions.exists() or ws_sessions.resolve() != cwd_sessions.resolve():
-            candidates.append(ws_sessions)
-    if not candidates:
-        # fall back to both locations even if they don't exist yet
-        uniq: list[Path] = []
-        seen_dirs: set[Path] = set()
-        for d in [cwd_sessions, ws_sessions]:
-            try:
-                rp = d.resolve()
-            except Exception:
-                rp = d
-            if rp not in seen_dirs:
-                seen_dirs.add(rp)
-                uniq.append(d)
-        candidates = uniq
-
-    seen_files: set[Path] = set()
-    all_files: list[Path] = []
-    for d in candidates:
-        for f in d.glob("*.jsonl"):
-            try:
-                rp = f.resolve()
-            except Exception:
-                rp = f
-            if rp not in seen_files:
-                seen_files.add(rp)
-                all_files.append(f)
-    all_files.sort(key=lambda p: p.name)
-
-    for fp in all_files:
+    sdir = sessions_dir(root)
+    for fp in sorted(sdir.glob("*.jsonl"), key=lambda p: p.name):
         try:
-            with open(fp, "r", encoding="utf-8") as fh:
-                first = fh.readline().strip()
-                if not first:
-                    raise ValueError("empty")
-                obj = json.loads(first)
-                if obj.get("type") != "session":
-                    raise ValueError("not session header")
-                sid = obj.get("id") or fp.stem
-                ts = obj.get("ts", "")
-                task = obj.get("task", "")
-                task_one = " ".join(str(task).splitlines()).strip()
-                if task_one:
-                    print(f"{sid} {ts} {task_one}")
-                else:
-                    print(f"{sid} {ts}".rstrip())
+            line = fp.read_text(encoding="utf-8").splitlines()[0].strip()
+            if not line:
+                raise ValueError("empty")
+            obj = json.loads(line)
+            if obj.get("type") != "session":
+                raise ValueError("not session")
+            sid = obj.get("id") or fp.stem
+            ts = obj.get("ts", "")
+            task = " ".join(str(obj.get("task", "")).splitlines()).strip()
+            if task:
+                print(f"{sid} {ts} {task}")
+            else:
+                print(f"{sid} {ts}".rstrip())
         except Exception:
             print(f"{fp.stem} (no header)")
 
@@ -403,7 +379,7 @@ def main() -> None:
     except RuntimeError as e:
         ap.error(f"{e} (or use --smoke for the no-API check)")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    result = run(args.task, root, args.max_steps, Path(f"sessions/{stamp}.jsonl"))
+    result = run(args.task, root, args.max_steps, sessions_dir(root) / f"{stamp}.jsonl")
     print(f"\nresult: {result}")
 
 
