@@ -9,6 +9,7 @@ import html
 import json
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,11 @@ from pathlib import Path
 
 MAX_OUTPUT_CHARS = 4000
 DEFAULT_TIMEOUT_S = 30
+# Web-search retry budget (seconds of total backoff sleep), mirroring model.py.
+# Kept local: tools never imports model internals.
+RETRY_BUDGET_S = 30.0
+RETRY_BASE_S = 1.0
+RETRY_CAP_S = 8.0
 BLOCKED_BASH_PATTERNS = ["rm -rf /", "rm -rf ~", ":(){", "mkfs", "dd of=/dev"]
 
 TOOLS = [
@@ -64,6 +70,13 @@ def truncate(s: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"\n... [truncated {len(s) - limit} chars]"
+
+
+def _retryable(exc: Exception) -> bool:
+    """Transient network failures retry; other 4xx fail immediately."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code < 600
+    return isinstance(exc, (urllib.error.URLError, OSError))
 
 
 def tool_read(root: Path, path: str, offset: int = 0, limit: int = 200) -> str:
@@ -158,11 +171,19 @@ def tool_search(root: Path, query: str, limit: int = 5) -> str:
     }
     url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "mini-agent/1.0 (https://example.com; educational)"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"error: network failure: {e}"
+    delay = RETRY_BASE_S
+    waited = 0.0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            break
+        except Exception as e:
+            if not _retryable(e) or waited + delay > RETRY_BUDGET_S:
+                return f"error: network failure: {e}"
+            time.sleep(delay)
+            waited += delay
+            delay = min(delay * 2, RETRY_CAP_S)
     try:
         data = json.loads(raw)
     except Exception as e:

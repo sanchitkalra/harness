@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agent
 
@@ -287,12 +289,14 @@ def test_web_search_success_and_truncation(tmp_path, monkeypatch):
 
 
 def test_web_search_network_failure(tmp_path, monkeypatch):
+    import time as _time
     import urllib.request as _urllib_req
 
     def fake_urlopen_fail(req, timeout=15):
         raise OSError("network down")
 
     monkeypatch.setattr(_urllib_req, "urlopen", fake_urlopen_fail)
+    monkeypatch.setattr(_time, "sleep", lambda s: None)  # retry budget elapses instantly
     out = agent.tool_search(tmp_path, "python", 5)
     assert out.startswith("error:")
     assert "network" in out.lower() or "failure" in out.lower()
@@ -304,3 +308,128 @@ def test_web_search_dispatch_bad_args(tmp_path):
     assert "missing_arg" in agent.dispatch(tmp_path, "web_search", {"query": "   "})
     # bad limit
     assert "bad_args" in agent.dispatch(tmp_path, "web_search", {"query": "hi", "limit": "notanint"})
+
+
+class _FakeResp:
+    """Minimal urlopen context manager yielding canned JSON bytes."""
+
+    def __init__(self, payload):
+        import json as _j
+        self._data = _j.dumps(payload).encode()
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _stub_sleep(monkeypatch):
+    import time as _time
+    slept = []
+    monkeypatch.setattr(_time, "sleep", slept.append)
+    return slept
+
+
+def _llm_key(monkeypatch):
+    clear_keys(monkeypatch)
+    monkeypatch.setenv("MODEL_API_KEY", "k")
+
+
+def test_llm_call_retries_transient_then_succeeds(monkeypatch):
+    import urllib.request as _urllib_req
+
+    _llm_key(monkeypatch)
+    attempts = []
+
+    def flaky(req, timeout=120):
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise OSError("network down")
+        return _FakeResp({"choices": [{"message": {"role": "assistant", "content": "hi"}}]})
+
+    monkeypatch.setattr(_urllib_req, "urlopen", flaky)
+    slept = _stub_sleep(monkeypatch)
+    msg = agent.llm_call([{"role": "user", "content": "hi"}], [])
+    assert msg == {"role": "assistant", "content": "hi"}
+    assert slept == [1.0, 2.0]  # exponential backoff from the 1s base
+
+
+def test_llm_call_gives_up_within_budget(monkeypatch):
+    import urllib.request as _urllib_req
+
+    _llm_key(monkeypatch)
+
+    def always_down(req, timeout=120):
+        raise OSError("network down")
+
+    monkeypatch.setattr(_urllib_req, "urlopen", always_down)
+    slept = _stub_sleep(monkeypatch)
+    with pytest.raises(agent.NetworkError, match="after retries"):
+        agent.llm_call([{"role": "user", "content": "hi"}], [])
+    assert slept, "should have backed off at least once"
+    assert sum(slept) <= 30.0, f"backoff exceeded 30s bound: {slept}"
+    assert all(b >= a for a, b in zip(slept, slept[1:])), f"backoff should grow: {slept}"
+
+
+def test_llm_call_no_retry_on_client_error(monkeypatch):
+    import urllib.error as _urlerr
+    import urllib.request as _urllib_req
+
+    _llm_key(monkeypatch)
+
+    def forbidden(req, timeout=120):
+        raise _urlerr.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr(_urllib_req, "urlopen", forbidden)
+    slept = _stub_sleep(monkeypatch)
+    with pytest.raises(_urlerr.HTTPError):
+        agent.llm_call([{"role": "user", "content": "hi"}], [])
+    assert slept == [], "4xx must fail fast without sleeping"
+
+
+def test_llm_call_retries_server_error(monkeypatch):
+    import urllib.error as _urlerr
+    import urllib.request as _urllib_req
+
+    _llm_key(monkeypatch)
+
+    def unavailable(req, timeout=120):
+        raise _urlerr.HTTPError(req.full_url, 503, "Unavailable", {}, None)
+
+    monkeypatch.setattr(_urllib_req, "urlopen", unavailable)
+    slept = _stub_sleep(monkeypatch)
+    with pytest.raises(agent.NetworkError, match="after retries"):
+        agent.llm_call([{"role": "user", "content": "hi"}], [])
+    assert slept and sum(slept) <= 30.0
+
+
+def test_run_returns_stopped_on_network_failure(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise agent.NetworkError("llm call failed after retries (~23s): down")
+
+    monkeypatch.setattr(agent, "llm_call", boom)
+    out = agent.run("t", tmp_path, max_steps=3)
+    assert out.startswith("stopped: network")
+
+
+def test_web_search_retries_then_succeeds(tmp_path, monkeypatch):
+    import urllib.request as _urllib_req
+
+    payload = {"query": {"search": [{"title": "Python", "snippet": "great"}]}}
+    attempts = []
+
+    def flaky(req, timeout=15):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("network down")
+        return _FakeResp(payload)
+
+    monkeypatch.setattr(_urllib_req, "urlopen", flaky)
+    slept = _stub_sleep(monkeypatch)
+    out = agent.tool_search(tmp_path, "python", 5)
+    assert "Python" in out
+    assert slept == [1.0]

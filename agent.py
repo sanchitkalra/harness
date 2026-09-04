@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ui
-from model import llm_call, llm_config
+from model import NetworkError, llm_call, llm_config
 from tools import (  # re-exported: tests and callers keep working via agent.*
     MAX_OUTPUT_CHARS,
     TOOLS,
@@ -85,7 +85,10 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
     seen: dict[tuple, int] = {}  # (tool, canonical args) -> times seen; bounded by repeat limit
     idle_turns = 0
     for step in range(1, max_steps + 1):
-        msg = llm_call(messages, TOOLS)
+        try:
+            msg = llm_call(messages, TOOLS)
+        except NetworkError as e:  # network down even after retries: stop, don't crash
+            return f"stopped: network ({e}, {step}/{max_steps} steps)"
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()

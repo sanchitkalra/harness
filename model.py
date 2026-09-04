@@ -7,10 +7,31 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.request
 
 META_BASE_URL = "https://api.meta.ai/v1"
 META_DEFAULT_MODEL = "muse-spark-1.1"
+
+# Network retry budget (seconds of total backoff sleep). Delays grow
+# exponentially from RETRY_BASE_S, capped at RETRY_CAP_S each.
+RETRY_BUDGET_S = 30.0
+RETRY_BASE_S = 1.0
+RETRY_CAP_S = 8.0
+
+
+class NetworkError(RuntimeError):
+    """The LLM HTTP call failed even after retrying within budget."""
+
+
+def _retryable(exc: Exception) -> bool:
+    """Only transient failures retry: timeouts, DNS/dropped connections,
+    HTTP 429 and 5xx. Other 4xx (auth, bad request) fail immediately —
+    retrying those just burns the budget."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code < 600
+    return isinstance(exc, (urllib.error.URLError, OSError))
 
 
 def llm_config() -> tuple[str, str, str]:
@@ -34,7 +55,12 @@ def llm_config() -> tuple[str, str, str]:
 
 
 def llm_call(messages: list[dict], tools: list[dict]) -> dict:
-    """One chat-completions call (OpenAI-compatible). Returns parsed message."""
+    """One chat-completions call (OpenAI-compatible). Returns parsed message.
+
+    Transient network failures retry with exponential backoff within
+    RETRY_BUDGET_S, then raise NetworkError. Non-retryable errors
+    (bad key, bad request, unparseable reply) raise as before.
+    """
     base, model, key = llm_config()
     schema = [
         {
@@ -56,6 +82,18 @@ def llm_call(messages: list[dict], tools: list[dict]) -> dict:
         data=body,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        data = json.load(r)
-    return data["choices"][0]["message"]
+    delay = RETRY_BASE_S
+    waited = 0.0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.load(r)
+            return data["choices"][0]["message"]
+        except Exception as e:
+            if not _retryable(e) or waited + delay > RETRY_BUDGET_S:
+                if _retryable(e):
+                    raise NetworkError(f"llm call failed after retries (~{waited:.0f}s): {e}") from e
+                raise
+            time.sleep(delay)
+            waited += delay
+            delay = min(delay * 2, RETRY_CAP_S)
