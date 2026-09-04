@@ -433,3 +433,48 @@ def test_web_search_retries_then_succeeds(tmp_path, monkeypatch):
     out = agent.tool_search(tmp_path, "python", 5)
     assert "Python" in out
     assert slept == [1.0]
+
+
+def test_ui_read_summary_no_color(capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    import ui
+    ui.tool_result("read_file", "lines 1-2 of 10\nfoo\nbar\n... [more]")
+    out = capsys.readouterr().out
+    assert "lines 1-2 of 10" in out
+    # header-only: body must not appear
+    assert "foo" not in out
+    assert "bar" not in out
+
+
+def test_ui_edit_diff_markers_no_color(capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    import ui
+    diff_text = "ok: edited foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old line\n+new line\n context"
+    ui.tool_result("edit_file", diff_text)
+    out = capsys.readouterr().out
+    assert "ok: edited foo.txt" in out
+    assert "-old line" in out
+    assert "+new line" in out
+    assert "---" in out or "+++" in out or "@@" in out
+
+
+def test_ui_write_diff_markers_no_color(capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    import ui
+    write_text = "ok: wrote new.txt (12 chars)\n+hello world\n+second line"
+    ui.tool_result("write_file", write_text)
+    out = capsys.readouterr().out
+    assert "ok: wrote new.txt" in out
+    assert "+hello world" in out
+    assert "+second line" in out
+
+
+def test_ui_error_passthrough_no_color(capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    import ui
+    for name in ("read_file", "edit_file", "write_file", "bash"):
+        capsys.readouterr()  # clear
+        ui.tool_result(name, "error: something went wrong")
+        out = capsys.readouterr().out
+        assert "error:" in out
+        assert "something went wrong" in out

@@ -126,7 +126,7 @@ def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Pat
                 result = dispatch(root, name, args)
             except Exception as e:  # surface sandbox errors to the model, don't crash
                 result = f"error: {e}"
-            ui.tool_result(result)
+            ui.tool_result(name, result)
             log(log_path, {"step": step, "tool": name, "args": args, "result": result[:2000]})
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
     return f"stopped: max_steps ({max_steps} steps without done)"

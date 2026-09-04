@@ -41,14 +41,53 @@ def tool_call(num: int, name: str, args_json: str) -> None:
         print(f"[step {num}] tool: {name} {truncated}")
 
 
-def tool_result(text: str) -> None:
-    truncated = (text or "")[:300]
+def tool_result(tool_name: str, text: str) -> None:
+    raw = text or ""
+    stripped = raw.lstrip()
+    is_error = stripped.startswith("error:")
+    lines = raw.splitlines()
+    first = lines[0] if lines else ""
+    truncated_first = first[:300]
+    truncated_full = raw[:300]
+
     if _use_color():
-        is_error = truncated.lstrip().startswith("error:") or (text or "").lstrip().startswith("error:")
         marker = f"{RED}✖{RESET}" if is_error else f"{GREEN}✔{RESET}"
-        print(f"  {marker} {DIM}{truncated}{RESET}")
+        if tool_name == "read_file":
+            # header-only for read
+            print(f"  {marker} {DIM}{truncated_first}{RESET}")
+        elif tool_name in ("edit_file", "write_file"):
+            if is_error:
+                print(f"  {marker} {DIM}{truncated_full}{RESET}")
+            else:
+                print(f"  {marker} {DIM}{truncated_first}{RESET}")
+                for ln in lines[1:]:
+                    # cap line length to avoid huge lines
+                    clipped = ln[:1000]
+                    if clipped.startswith("+++") or clipped.startswith("---"):
+                        print(f"  {DIM}{clipped}{RESET}")
+                    elif clipped.startswith("@@"):
+                        print(f"  {CYAN}{clipped}{RESET}")
+                    elif clipped.startswith("+"):
+                        print(f"  {GREEN}{clipped}{RESET}")
+                    elif clipped.startswith("-"):
+                        print(f"  {RED}{clipped}{RESET}")
+                    else:
+                        print(f"  {DIM}{clipped}{RESET}")
+        else:
+            print(f"  {marker} {DIM}{truncated_full}{RESET}")
     else:
-        print(f"  -> {truncated}")
+        # NO_COLOR / non-TTY: plain output, preserved for tests/logs
+        if tool_name == "read_file":
+            print(f"  -> {truncated_first}")
+        elif tool_name in ("edit_file", "write_file"):
+            if not lines:
+                print("  ->")
+                return
+            print(f"  -> {lines[0][:1000]}")
+            for ln in lines[1:1000]:
+                print(f"  {ln[:1000]}")
+        else:
+            print(f"  -> {truncated_full}")
 
 
 def final(summary: str) -> None:

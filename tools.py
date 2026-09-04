@@ -5,6 +5,7 @@ rejects anything escaping the workspace root.
 """
 from __future__ import annotations
 
+import difflib
 import html
 import json
 import re
@@ -72,6 +73,47 @@ def truncate(s: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return s[:limit] + f"\n... [truncated {len(s) - limit} chars]"
 
 
+def _unified_diff(old_text: str, new_text: str, path: str, max_lines: int = 200, max_chars: int = MAX_OUTPUT_CHARS) -> str:
+    """Return a capped unified diff string."""
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    diff_iter = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+        n=3,
+    )
+    diff_lines = list(diff_iter)
+    if not diff_lines:
+        return ""
+    if len(diff_lines) > max_lines:
+        remaining = len(diff_lines) - max_lines
+        diff_lines = diff_lines[:max_lines]
+        diff_lines.append(f"... [truncated {remaining} lines]")
+    text = "\n".join(diff_lines)
+    if len(text) > max_chars:
+        # slice then annotate using overflow length
+        overflow = len(text) - max_chars
+        text = text[:max_chars] + f"\n... [truncated {overflow} chars]"
+    return text
+
+
+def _added_lines_diff(content: str, max_lines: int = 200, max_chars: int = MAX_OUTPUT_CHARS) -> str:
+    """Return capped added-lines view (+ prefixed) for new files."""
+    lines = content.splitlines()
+    capped = lines[:max_lines]
+    out = [f"+{ln}" for ln in capped]
+    if len(lines) > max_lines:
+        out.append(f"... [truncated {len(lines) - max_lines} lines]")
+    text = "\n".join(out)
+    if len(text) > max_chars:
+        overflow = len(text) - max_chars
+        text = text[:max_chars] + f"\n... [truncated {overflow} chars]"
+    return text
+
+
 def _retryable(exc: Exception) -> bool:
     """Transient network failures retry; other 4xx fail immediately."""
     if isinstance(exc, urllib.error.HTTPError):
@@ -113,7 +155,11 @@ def tool_edit(root: Path, path: str, find: str, replace: str) -> str:
         return "error: 'find' string not found (0 matches)"
     if n > 1:
         return f"error: 'find' matches {n} times; include more context to make it unique"
-    p.write_text(text.replace(find, replace), encoding="utf-8")
+    new_text = text.replace(find, replace)
+    diff_text = _unified_diff(text, new_text, path)
+    p.write_text(new_text, encoding="utf-8")
+    if diff_text:
+        return f"ok: edited {path}\n{diff_text}"
     return f"ok: edited {path}"
 
 
@@ -130,9 +176,14 @@ def tool_write(root: Path, path: str, content: str, overwrite: str = "") -> str:
         return f"error: exists: {path!r} already exists; pass 'overwrite': 'true' to replace it"
     if not p.parent.exists():
         return f"error: no_parent: parent dir {str(p.parent.relative_to(root.resolve()))!r} does not exist; run mkdir via bash first"
+    existed = p.exists()
     p.write_text(content, encoding="utf-8")
-    action = "overwrote" if want_overwrite and p.exists() else "wrote"
-    return f"ok: {action} {path} ({len(content)} chars)"
+    action = "overwrote" if existed else "wrote"
+    base = f"ok: {action} {path} ({len(content)} chars)"
+    added = _added_lines_diff(content)
+    if added:
+        return f"{base}\n{added}"
+    return base
 
 
 def tool_bash(root: Path, command: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> str:
