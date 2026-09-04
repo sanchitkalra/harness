@@ -141,34 +141,39 @@ def drive(
             messages.append({"role": "user", "content": "Continue: call a tool or done."})
             continue
         idle_turns = 0
-        for c in calls:
-            name = c["function"]["name"]
-            try:
-                args = json.loads(c["function"].get("arguments") or "{}")
-            except json.JSONDecodeError as e:
-                messages.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": f"error: bad_args: arguments are not valid JSON ({e}); retry with quoted strings"})
-                continue
-            key = (name, json.dumps(args, sort_keys=True))
-            seen[key] = seen.get(key, 0) + 1
-            if seen[key] > 1:  # repeat: warn, and stop if it keeps going nowhere
-                if seen[key] >= MAX_REPEAT_CALLS:
-                    return f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)"
-                messages.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
-                continue
-            ui.tool_call(step, name, json.dumps(args))
-            if name == "done":
-                final = args.get("summary", "")
-                log(log_path, {"step": step, "tool": name, "args": args, "result": final})
-                return final
-            try:
-                result = dispatch(root, name, args)
-            except Exception as e:  # surface sandbox errors to the model, don't crash
-                result = f"error: {e}"
-            ui.tool_result(name, result)
-            log(log_path, {"step": step, "tool": name, "args": args, "result": result[:2000]})
-            messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        ui.begin_tools(step)
+        try:
+            for c in calls:
+                name = c["function"]["name"]
+                try:
+                    args = json.loads(c["function"].get("arguments") or "{}")
+                except json.JSONDecodeError as e:
+                    messages.append({"role": "tool", "tool_call_id": c["id"],
+                                     "content": f"error: bad_args: arguments are not valid JSON ({e}); retry with quoted strings"})
+                    continue
+                key = (name, json.dumps(args, sort_keys=True))
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] > 1:  # repeat: warn, and stop if it keeps going nowhere
+                    if seen[key] >= MAX_REPEAT_CALLS:
+                        return f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)"
+                    messages.append({"role": "tool", "tool_call_id": c["id"],
+                                     "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
+                    continue
+                ui.tool_call(step, name, json.dumps(args))
+                if name == "done":
+                    final = args.get("summary", "")
+                    log(log_path, {"step": step, "tool": name, "args": args, "result": final})
+                    ui.end_tools()
+                    return final
+                try:
+                    result = dispatch(root, name, args)
+                except Exception as e:  # surface sandbox errors to the model, don't crash
+                    result = f"error: {e}"
+                ui.tool_result(name, result)
+                log(log_path, {"step": step, "tool": name, "args": args, "result": result[:2000]})
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        finally:
+            ui.end_tools()
     return f"stopped: max_steps ({max_steps} steps without done)"
 
 
