@@ -155,6 +155,18 @@ SYSTEM = (
 )
 
 
+def load_instructions(root: Path) -> str:
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        p = root / name
+        try:
+            if p.is_file():
+                text = p.read_text(encoding="utf-8")
+                return text[:2000]
+        except Exception:
+            continue
+    return ""
+
+
 META_BASE_URL = "https://api.meta.ai/v1"
 META_DEFAULT_MODEL = "muse-spark-1.1"
 
@@ -232,8 +244,10 @@ def dispatch(root: Path, name: str, args: dict) -> str:
 
 
 def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None) -> str:
+    instr = load_instructions(root)
+    sys_content = SYSTEM + (f"\n\nWorkspace instructions:\n{instr}" if instr else "")
     messages: list[dict] = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": sys_content},
         {"role": "user", "content": task},
     ]
     if log_path is not None:

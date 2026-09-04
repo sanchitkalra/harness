@@ -161,6 +161,35 @@ def test_session_header_roundtrip(tmp_path, monkeypatch):
     assert header2["workspace"] == str(tmp_path)
 
 
+def test_load_instructions_precedence_and_truncation(tmp_path):
+    # empty -> ""
+    assert agent.load_instructions(tmp_path) == ""
+    # CLAUDE.md fallback
+    (tmp_path / "CLAUDE.md").write_text("from claude")
+    assert agent.load_instructions(tmp_path) == "from claude"
+    # AGENTS.md wins over CLAUDE.md
+    (tmp_path / "AGENTS.md").write_text("from agents")
+    assert agent.load_instructions(tmp_path) == "from agents"
+    # truncates to 2000 chars
+    (tmp_path / "AGENTS.md").write_text("x" * 5000)
+    assert len(agent.load_instructions(tmp_path)) == 2000
+
+
+def test_run_injects_instructions(tmp_path, monkeypatch):
+    (tmp_path / "AGENTS.md").write_text("INJECTED_GUIDE")
+    captured = {}
+
+    def fake_llm_call(messages, tools):
+        captured["messages"] = messages
+        return _call("done", {"summary": "ok"})
+
+    monkeypatch.setattr(agent, "llm_call", fake_llm_call)
+    agent.run("do thing", tmp_path, max_steps=2)
+    sys_msg = captured["messages"][0]["content"]
+    assert "INJECTED_GUIDE" in sys_msg
+    assert agent.SYSTEM in sys_msg
+
+
 def test_sessions_dir_and_list(tmp_path, capsys):
     sdir = agent.sessions_dir(tmp_path)
     assert sdir == tmp_path / "sessions"
