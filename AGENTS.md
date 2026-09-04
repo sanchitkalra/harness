@@ -6,7 +6,10 @@
 - Bash tool cwd is the workspace root.
 
 ## Layout
-- `agent.py` — main harness (tool loop, sandbox, session logging).
+- `agent.py` — orchestration (run loop, sessions, CLI). Re-exports tools/model names so `agent.*` keeps working.
+- `model.py` — LLM client only (`llm_config`, `llm_call`). Never prints, never touches files.
+- `tools.py` — workspace tools only (`TOOLS`, `resolve`, `tool_*`, `dispatch`). Never prints, never calls the model.
+- `ui.py` — terminal rendering only. Takes plain data, never imports model/tools internals.
 - `tests/` — pytest suite; entry `tests/test_agent.py`.
 - `sessions/` — JSONL replay logs; managed via `sessions_dir()` which is `root / "sessions"`. Paths logged under `workspace` are absolute/root-canonical.
 - `AGENTS.md` takes precedence; `CLAUDE.md` is fallback for workspace instructions via `load_instructions()`.

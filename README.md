@@ -1,6 +1,8 @@
 # Mini coding-agent harness
 
-A ~230-line agent you can read end to end: LLM + tool loop in `agent.py`.
+Four small modules with strict boundaries: `agent.py` orchestrates (loop,
+sessions, CLI), `model.py` talks to the LLM, `tools.py` touches the
+workspace, `ui.py` renders the terminal. Each is readable end to end.
 
 ## Setup (project-local env)
 
@@ -38,11 +40,15 @@ OpenAI works too: set `OPENAI_API_KEY` (takes precedence) with optional `OPENAI_
 
 ## What's inside (learning map)
 
-- `TOOLS` — tool schemas sent to the model
-- `resolve()` — sandbox: every path must stay under workspace root
-- `tool_read / tool_edit / tool_bash` — with uniqueness check, timeout, truncation
-- `run()` — the loop: prompt -> tool call -> execute -> feed back; breaks on `done`, max steps, or repeated calls
+- `model.py` — `llm_config()` + `llm_call()`; knows nothing about tools or files
+- `tools.py` — `TOOLS`, `resolve()` sandbox, `tool_read / tool_edit / tool_write / tool_bash`, `dispatch()`
+- `ui.py` — terminal rendering (ANSI on tty only); takes plain data, never imports the other modules
+- `agent.py` — `run()` loop, session headers + `--list` / `--fork`, `load_instructions()`, `smoke_test()`, CLI
 - `smoke_test()` + `tests/` — how to test without spending API calls
+
+Coupling rules: agent talks to the model only via `llm_call(messages, tools)`,
+to tools only via `dispatch(name, args)`, to UI only via `ui.*`. Tests import
+`agent.*` (re-exported) so module moves don't break them.
 
 ## Next experiments
 
