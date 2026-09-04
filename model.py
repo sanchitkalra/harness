@@ -21,6 +21,16 @@ RETRY_BASE_S = 1.0
 RETRY_CAP_S = 8.0
 
 
+class ApiError(RuntimeError):
+    """Non-retryable API error (4xx except 429) with status, reason, snippet."""
+
+    def __init__(self, status_code: int, reason: str, body_snippet: str):
+        self.status_code = status_code
+        self.reason = reason
+        self.body_snippet = body_snippet
+        super().__init__(f"API error {status_code} {reason}: {body_snippet}")
+
+
 class NetworkError(RuntimeError):
     """The LLM HTTP call failed even after retrying within budget."""
 
@@ -90,10 +100,22 @@ def llm_call(messages: list[dict], tools: list[dict]) -> dict:
                 data = json.load(r)
             return data["choices"][0]["message"]
         except Exception as e:
-            if not _retryable(e) or waited + delay > RETRY_BUDGET_S:
-                if _retryable(e):
-                    raise NetworkError(f"llm call failed after retries (~{waited:.0f}s): {e}") from e
+            if not _retryable(e):
+                if isinstance(e, urllib.error.HTTPError):
+                    try:
+                        raw = e.read()
+                        if isinstance(raw, bytes):
+                            txt = raw.decode("utf-8", errors="ignore")
+                        else:
+                            txt = str(raw) if raw is not None else ""
+                    except Exception:
+                        txt = ""
+                    snippet = txt[:500]
+                    reason = e.reason if isinstance(e.reason, str) else str(e.reason)
+                    raise ApiError(e.code, reason, snippet) from e
                 raise
+            if waited + delay > RETRY_BUDGET_S:
+                raise NetworkError(f"llm call failed after retries (~{waited:.0f}s): {e}") from e
             time.sleep(delay)
             waited += delay
             delay = min(delay * 2, RETRY_CAP_S)

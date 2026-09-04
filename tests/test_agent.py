@@ -386,7 +386,7 @@ def test_llm_call_no_retry_on_client_error(monkeypatch):
 
     monkeypatch.setattr(_urllib_req, "urlopen", forbidden)
     slept = _stub_sleep(monkeypatch)
-    with pytest.raises(_urlerr.HTTPError):
+    with pytest.raises(agent.ApiError):
         agent.llm_call([{"role": "user", "content": "hi"}], [])
     assert slept == [], "4xx must fail fast without sleeping"
 
@@ -562,3 +562,39 @@ def test_load_memory_truncation(tmp_path):
     msgs = agent.new_conversation("hi", tmp_path)
     assert long_text[:2000] in msgs[0]["content"]
     assert long_text[2000:] not in msgs[0]["content"]
+
+
+def test_llm_call_surfaces_status_code(monkeypatch):
+    import io
+    import urllib.error as _urlerr
+    import urllib.request as _urllib_req
+
+    _llm_key(monkeypatch)
+
+    body = b'{"error":{"message":"bad request detail too long ' + b"x" * 600 + b'"}}'
+
+    def bad_req(req, timeout=120):
+        raise _urlerr.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(_urllib_req, "urlopen", bad_req)
+    _stub_sleep(monkeypatch)
+    try:
+        agent.llm_call([{"role": "user", "content": "hi"}], [])
+    except agent.ApiError as e:
+        assert e.status_code == 400
+        assert "Bad Request" in e.reason or "Bad Request" in str(e)
+        assert len(e.body_snippet) <= 500
+        assert "bad request detail" in e.body_snippet.lower() or "bad request" in e.body_snippet.lower()
+    else:
+        raise AssertionError("expected ApiError")
+
+
+def test_drive_returns_stopped_api_on_api_error(tmp_path, monkeypatch):
+    def raise_api(*a, **k):
+        raise agent.ApiError(401, "Unauthorized", "invalid key snippet")
+
+    monkeypatch.setattr(agent, "llm_call", raise_api)
+    messages = agent.new_conversation("do thing", tmp_path)
+    out = agent.drive(messages, tmp_path, max_steps=3)
+    assert out.startswith("stopped: api")
+    assert "401" in out or "Unauthorized" in out

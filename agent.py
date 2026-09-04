@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ui
-from model import NetworkError, llm_call, llm_config
+from model import ApiError, NetworkError, llm_call, llm_config
 from tools import (  # re-exported: tests and callers keep working via agent.*
     MAX_OUTPUT_CHARS,
     TOOLS,
@@ -131,6 +131,8 @@ def drive(
     for step in range(1, max_steps + 1):
         try:
             msg = llm_call(messages, TOOLS)
+        except ApiError as e:
+            return f"stopped: api ({e}, {step}/{max_steps} steps)"
         except NetworkError as e:  # network down even after retries: stop, don't crash
             return f"stopped: network ({e}, {step}/{max_steps} steps)"
         messages.append(msg)
