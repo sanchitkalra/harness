@@ -24,6 +24,9 @@ K_HUNK = "hunk"
 K_DIM = "dim"
 K_INPUT = "input"
 K_RESULT = "result"
+K_HEAD = "head"
+K_ADDROW = "addrow"
+K_DELROW = "delrow"
 K_SUMMARY = "summary"
 K_SUMMARY_ERR = "summary_err"
 K_PLAIN = "plain"
@@ -399,18 +402,76 @@ def _arg_hint(name: str, args_json: str) -> str:
     return ""
 
 
-def _diff_kind(line: str) -> str:
-    """Pure diff-line classifier for coloring."""
-    s = line.lstrip()
-    if s.startswith("+++") or s.startswith("---"):
-        return K_DIM
-    if s.startswith("@@"):
-        return K_HUNK
-    if s.startswith("+"):
-        return K_ADD
-    if s.startswith("-"):
-        return K_DEL
-    return K_DIM
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def format_file_diff(diff_lines: list[str], path_hint: str = "") -> tuple[str, str, list[tuple[str, str]]]:
+    """Pure Claude-style file-diff formatter.
+
+    Parses unified hunks (---/+++/@@) or bare +lines (new files).
+    Returns (filename, stat_line, styled_lines) where styled_lines are
+    (kind, text) with gutter numbers; +/- rows use K_ADDROW/K_DELROW
+    for full-width background rendering.
+    """
+    import re
+    filename = path_hint
+    hunks: list[str] = []
+    for ln in diff_lines:
+        if ln.startswith("+++ "):
+            filename = ln[4:].strip()
+            if filename.startswith("b/"):
+                filename = filename[2:]
+        elif ln.startswith("--- ") or ln.startswith("+++"):
+            continue
+        else:
+            hunks.append(ln)
+
+    styled: list[tuple[str, str]] = []
+    added = removed = 0
+    old = new = 0
+    in_hunk = False
+    for ln in hunks:
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", ln)
+        if m:
+            old, new = int(m.group(1)), int(m.group(2))
+            in_hunk = True
+            continue
+        if not in_hunk:
+            # bare mode (new file): +lines are additions from line 1
+            if ln.startswith("+") and not ln.startswith("+++"):
+                added += 1
+                new += 1
+                styled.append((K_ADDROW, f"{new:>4} + {ln[1:]}"))
+            elif ln.startswith("-") and not ln.startswith("---"):
+                removed += 1
+                old += 1
+                styled.append((K_DELROW, f"{old:>4} - {ln[1:]}"))
+            elif ln:
+                styled.append((K_DIM, f"      {ln}"))
+            continue
+        if ln.startswith("+"):
+            added += 1
+            styled.append((K_ADDROW, f"{new:>4} + {ln[1:]}"))
+            new += 1
+        elif ln.startswith("-"):
+            removed += 1
+            styled.append((K_DELROW, f"{old:>4} - {ln[1:]}"))
+            old += 1
+        elif ln.startswith(" "):
+            styled.append((K_DIM, f"{old:>4}   {ln[1:]}"))
+            old += 1
+            new += 1
+        elif ln.startswith("\\"):
+            continue  # "\ No newline at end of file"
+
+    if added and not removed:
+        stat = f"Added {_plural(added, 'line')}"
+    elif removed and not added:
+        stat = f"Removed {_plural(removed, 'line')}"
+    else:
+        stat = f"Added {_plural(added, 'line')}, removed {_plural(removed, 'line')}"
+    return filename, stat, styled
 
 
 # ----------------------------------------------------------------------
@@ -554,12 +615,19 @@ class TuiRenderer:
                     entry["ok"] = not is_error
                     break
         kind = K_ERR if is_error else K_OK
-        first = raw.splitlines()[0] if raw.splitlines() else ""
-        self.transcript.append(f"  -> {tool_name}: {first[:500]}", kind)
-        # a few extra diff lines for edits/writes
         if tool_name in ("edit_file", "write_file") and not is_error:
-            for ln in raw.splitlines()[1:6]:
-                self.transcript.append(f"     {ln[:800]}", _diff_kind(ln))
+            import re as _re
+            first_line = raw.splitlines()[0] if raw.splitlines() else ""
+            m = _re.match(r"ok: (?:edited|wrote|overwrote) (\S+)", first_line)
+            path_hint = m.group(1) if m else ""
+            fname, stat, styled = format_file_diff(raw.splitlines()[1:], path_hint)
+            self.transcript.append(f"Update({fname})" if fname else "Update", K_HEAD)
+            self.transcript.append(f"└ {stat}", K_DIM)
+            for k, t in styled:
+                self.transcript.append(t, k)
+        else:
+            first = raw.splitlines()[0] if raw.splitlines() else ""
+            self.transcript.append(f"  -> {tool_name}: {first[:500]}", kind)
         self._redraw_transcript_if_needed()
 
     def final(self, summary: str) -> None:
@@ -739,7 +807,11 @@ class TuiRenderer:
                 if idx >= height:
                     break
                 try:
-                    if kind in (K_SUMMARY, K_SUMMARY_ERR) and len(chunk) >= 2:
+                    if kind in (K_ADDROW, K_DELROW):
+                        # full-width background row
+                        row = chunk.ljust(width - 1)[:width - 1]
+                        self._transcript_win.addnstr(idx, 0, row, width - 1, self._kind_attr(kind))
+                    elif kind in (K_SUMMARY, K_SUMMARY_ERR) and len(chunk) >= 2:
                         marker_attr = self._kind_attr(K_ERR if kind == K_SUMMARY_ERR else K_OK)
                         self._transcript_win.addnstr(idx, 0, chunk[:2], width - 1, marker_attr)
                         self._transcript_win.addnstr(idx, 2, chunk[2:], max(0, width - 3), self._kind_attr(kind))
@@ -820,11 +892,18 @@ class TuiRenderer:
             curses.init_pair(1, curses.COLOR_GREEN, -1)
             curses.init_pair(2, curses.COLOR_RED, -1)
             curses.init_pair(3, curses.COLOR_CYAN, -1)
+            try:
+                curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_RED)
+                curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_GREEN)
+                add_bg = curses.color_pair(6)
+                del_bg = curses.color_pair(5)
+            except curses.error:
+                add_bg = del_bg = 0
             green = curses.color_pair(1)
             red = curses.color_pair(2)
             cyan = curses.color_pair(3)
         except Exception:
-            green = red = cyan = 0
+            green = red = cyan = add_bg = del_bg = 0
         try:
             import curses
             bold, dim = curses.A_BOLD, curses.A_DIM
@@ -837,6 +916,9 @@ class TuiRenderer:
             K_ERR: red,
             K_ADD: green,
             K_DEL: red,
+            K_HEAD: bold,
+            K_ADDROW: add_bg if add_bg else green,
+            K_DELROW: del_bg if del_bg else red,
             K_HUNK: cyan,
             K_DIM: dim,
             K_INPUT: bold,

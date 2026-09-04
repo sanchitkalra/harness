@@ -359,3 +359,60 @@ def test_toggle_row_mapping():
     assert r.toggle_at_row(1) is True
     assert r.toggle_at_row(0) is False  # plain line, no record
     assert r.toggle_at_row(99) is False
+
+
+def test_format_file_diff_unified():
+    from tui import format_file_diff, K_ADDROW, K_DELROW, K_DIM
+    diff = [
+        "--- a/tui.py",
+        "+++ b/tui.py",
+        "@@ -881,8 +881,8 @@",
+        " import curses",
+        "-self._setup_windows()",
+        "+needed = len(wrap_line(x))",
+        "+self._setup_windows(needed)",
+        " self._draw_transcript()",
+    ]
+    fname, stat, styled = format_file_diff(diff, "tui.py")
+    assert fname == "tui.py"
+    assert stat == "Added 2 lines, removed 1 line"
+    kinds = [k for k, _ in styled]
+    assert kinds == [K_DIM, K_DELROW, K_ADDROW, K_ADDROW, K_DIM]
+    texts = [t for _, t in styled]
+    assert texts[0] == " 881   import curses"
+    assert texts[1] == " 882 - self._setup_windows()"
+    assert texts[2] == " 882 + needed = len(wrap_line(x))"
+    assert texts[3] == " 883 + self._setup_windows(needed)"
+
+
+def test_format_file_diff_singular_and_new_file():
+    from tui import format_file_diff, K_ADDROW
+    fname, stat, styled = format_file_diff(["+hello", "+world"], "n.txt")
+    assert fname == "n.txt"
+    assert stat == "Added 2 lines"
+    assert all(k == K_ADDROW for k, _ in styled)
+    assert styled[0][1].startswith("   1 +")
+    fname2, stat2, _ = format_file_diff(["+only"], "one.txt")
+    assert stat2 == "Added 1 line"
+
+
+def test_renderer_edit_block():
+    from tui import K_HEAD, K_DIM
+    r = TuiRenderer(model_name="m", session_id="s")
+    r.begin_tools(1)
+    r.tool_call(1, "edit_file", '{"path": "f.py", "find": "a", "replace": "b"}')
+    r.tool_result("edit_file", "ok: edited f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,3 +1,3 @@\n line1\n-line2\n+LINE2\n line3")
+    pre = r.transcript.lines
+    assert "Update(f.py)" in pre
+    assert any("Added 1 line, removed 1 line" in l for l in pre)
+    assert any("LINE2" in l for l in pre)
+    kinds = dict((t, k) for k, t in r.transcript.items())
+    assert kinds["Update(f.py)"] == K_HEAD
+    r.end_tools()
+    lines = r.transcript.lines
+    # collapse replaces the block with one summary
+    assert sum(1 for l in lines if "↳" in l) == 1
+    assert not any(l.startswith("  -> edit_file") for l in lines)
+    # click restores the styled block
+    assert r.toggle_at_index(next(iter(r._collapsed))) is True
+    assert "Update(f.py)" in r.transcript.lines
