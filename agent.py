@@ -401,6 +401,9 @@ def main() -> None:
                     if not use_tui:
                         print()
                     continue
+                if use_tui and renderer.take_clear_request():
+                    messages = new_conversation("", root)
+                    prev_id = None
                 if line is None:
                     if not use_tui:
                         print()

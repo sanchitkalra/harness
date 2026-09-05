@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rich.text import Text
 from textual.widgets import Collapsible, Static
 
+import tui
 from tui import TuiRenderer, _arg_hint, format_file_diff, format_status, summarize_batch
 
 
@@ -139,5 +140,124 @@ def test_renderer_end_to_end_smoke():
             t.join(timeout=2)
             assert result["line"] == "hello"
             assert any("hello" in t for t in _static_texts(app))
+
+    asyncio.run(body())
+
+
+def test_slash_name_command_renames_session_without_reaching_the_agent():
+    """/name is intercepted by read_line() and never returned as a task."""
+
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            result: dict = {}
+
+            def get_line():
+                result["line"] = app.read_line("> ")
+
+            t = threading.Thread(target=get_line, daemon=True)
+            t.start()
+            await pilot.pause()
+            await pilot.click("#input")
+            await pilot.press(*"/name my tests", "enter")
+            # slash command consumed: read_line loops, doesn't return yet
+            await pilot.pause()
+            await asyncio.sleep(0.05)
+            assert "line" not in result
+            assert app.session_name == "my tests"
+            assert "session: my tests" in app._status.content.plain
+
+            await pilot.click("#input")
+            await pilot.press(*"real task", "enter")
+            t.join(timeout=2)
+            assert result["line"] == "real task"
+
+    asyncio.run(body())
+
+
+def test_unknown_slash_command_shows_error():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/bogus")
+            await pilot.pause()
+            assert any("unknown command: /bogus" in t for t in _static_texts(app))
+
+    asyncio.run(body())
+
+
+def test_slash_help_lists_all_commands():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/help")
+            await pilot.pause()
+            joined = "\n".join(_static_texts(app))
+            for name in tui.SLASH_COMMANDS:
+                assert f"/{name}" in joined
+
+    asyncio.run(body())
+
+
+def test_slash_clear_wipes_transcript_and_flags_a_context_reset():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            app._mount_line("some old output", "dim")
+            await pilot.pause()
+            assert not app.take_clear_request()  # nothing requested yet
+
+            app._handle_slash_command("/clear")
+            await pilot.pause()
+            texts = _static_texts(app)
+            assert not any("some old output" in t for t in texts)
+            assert any("cleared" in t for t in texts)
+            # agent.py's session loop consumes this once to reset `messages`
+            assert app.take_clear_request() is True
+            assert app.take_clear_request() is False  # one-shot
+
+    asyncio.run(body())
+
+
+def test_slash_quit_exits_and_unblocks_read_line():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            result: dict = {}
+
+            def get_line():
+                result["line"] = app.read_line("> ")
+
+            t = threading.Thread(target=get_line, daemon=True)
+            t.start()
+            await pilot.pause()
+            await pilot.click("#input")
+            await pilot.press(*"/quit", "enter")
+            t.join(timeout=2)
+            assert result["line"] is None
+
+    asyncio.run(body())
+
+
+def test_hints_show_and_filter_while_typing_a_slash_command():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            await pilot.click("#input")
+            await pilot.press("/")
+            await pilot.pause()
+            assert "visible" in app._hints.classes
+            for name in tui.SLASH_COMMANDS:
+                assert f"/{name}" in app._hints.content.plain
+
+            await pilot.press(*"na")  # narrows to /name (not /rename, /help, ...)
+            await pilot.pause()
+            hint_text = app._hints.content.plain
+            assert "/name" in hint_text
+            assert "/help" not in hint_text and "/rename" not in hint_text
+
+            await pilot.press(" ")  # space: now typing the argument, hide hints
+            await pilot.pause()
+            assert "visible" not in app._hints.classes
 
     asyncio.run(body())

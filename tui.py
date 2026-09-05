@@ -28,7 +28,12 @@ from textual.widgets import Collapsible, Input, Static
 # ----------------------------------------------------------------------
 
 
-def format_status(model_name: str, step_count: int | None = None, session_id: str | None = None) -> str:
+def format_status(
+    model_name: str,
+    step_count: int | None = None,
+    session_id: str | None = None,
+    session_name: str | None = None,
+) -> str:
     model = str(model_name or "unknown").strip() or "unknown"
     steps = 0
     if step_count is not None:
@@ -36,8 +41,8 @@ def format_status(model_name: str, step_count: int | None = None, session_id: st
             steps = int(step_count)
         except Exception:
             steps = 0
-    sid = (session_id or "").strip()
-    return f"{model} | steps {steps}" + (f" | {sid}" if sid else "")
+    label = (session_name or "").strip() or (session_id or "").strip()
+    return f"{model} | steps {steps}" + (f" | session: {label}" if label else "")
 
 
 def _arg_hint(name: str, args_json: str) -> str:
@@ -113,6 +118,16 @@ def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
     if errors:
         parts.append(f"{errors} error(s)")
     return (" · ".join(parts)) or "tools", errors > 0
+
+
+SLASH_COMMANDS: dict[str, str] = {
+    "help": "list available commands",
+    "name": "rename this session (shown in the status bar)",
+    "rename": "alias for /name",
+    "clear": "clear the transcript and start a new conversation",
+    "quit": "exit the app",
+    "exit": "alias for /quit",
+}
 
 
 def format_file_diff(diff_lines: list[str], path_hint: str = "") -> tuple[str, str, list[tuple[str, str]]]:
@@ -203,6 +218,8 @@ class TuiRenderer(App):
     Collapsible { padding: 0; margin: 0; }
     Collapsible.err > CollapsibleTitle { color: $error; }
     Collapsible.ok > CollapsibleTitle { color: $success; }
+    #hints { color: $text-muted; padding: 0 1; height: auto; display: none; }
+    #hints.visible { display: block; }
     """
     # ponytail: quit is only reachable between turns (queue-driven), not while
     # a turn is running on the worker thread — Python can't deliver a signal
@@ -214,38 +231,65 @@ class TuiRenderer(App):
         super().__init__()
         self.model_name = model_name or "unknown"
         self.session_id = session_id or ""
+        self.session_name = ""
         self.step_count = 0
         self._input_queue: "queue.Queue[str | None]" = queue.Queue()
         self._batch: list[dict] | None = None
         self._transcript: VerticalScroll | None = None
         self._status: Static | None = None
         self._input: Input | None = None
+        self._hints: Static | None = None
         # Set once the app's event loop is actually running — call_from_thread
         # raises if invoked before this, so the session worker thread must
         # wait on it before touching any Renderer method.
         self._loop_ready = threading.Event()
+        # Set by /clear (UI thread), consumed by agent.py's session loop
+        # (worker thread) — the renderer doesn't own `messages`, so it can
+        # only ask the loop to reset it, not do so itself.
+        self._clear_requested = threading.Event()
 
     def wait_until_ready(self, timeout: float | None = None) -> None:
         self._loop_ready.wait(timeout)
+
+    def take_clear_request(self) -> bool:
+        """True (once) if /clear was run since the last call."""
+        was_set = self._clear_requested.is_set()
+        self._clear_requested.clear()
+        return was_set
 
     # ---- Textual app ----
 
     def compose(self) -> ComposeResult:
         yield Static(id="status")
         yield VerticalScroll(id="transcript")
-        yield Input(placeholder="type a task, enter to send", id="input")
+        yield Static(id="hints")
+        yield Input(placeholder="type a task, enter to send  ·  / for commands", id="input")
 
     def on_mount(self) -> None:
         self._transcript = self.query_one("#transcript", VerticalScroll)
         self._status = self.query_one("#status", Static)
         self._input = self.query_one("#input", Input)
+        self._hints = self.query_one("#hints", Static)
         self._refresh_status()
+        self._mount_line("Tip: type / to see available commands (e.g. /help).", "dim")
         self._input.focus()
         self._loop_ready.set()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        text = event.value
+        if text.startswith("/") and " " not in text:
+            prefix = text[1:].lower()
+            matches = [(n, d) for n, d in SLASH_COMMANDS.items() if n.startswith(prefix)]
+            if matches:
+                self._hints.update(Text("\n".join(f"/{n} — {d}" for n, d in matches)))
+                self._hints.set_class(True, "visible")
+                return
+        self._hints.set_class(False, "visible")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value
         self._input.value = ""
+        self._hints.set_class(False, "visible")
         self._input_queue.put(text)
 
     def action_quit_app(self) -> None:
@@ -254,7 +298,7 @@ class TuiRenderer(App):
 
     def _refresh_status(self) -> None:
         if self._status is not None:
-            self._status.update(Text(format_status(self.model_name, self.step_count, self.session_id)))
+            self._status.update(Text(format_status(self.model_name, self.step_count, self.session_id, self.session_name)))
 
     def _mount_line(self, text: str, cls: str = "") -> Static:
         w = Static(Text(text), classes=cls)
@@ -265,6 +309,11 @@ class TuiRenderer(App):
     def _mount_user_message(self, text: str) -> None:
         self._transcript.mount(Static(Text(text), classes="usermsg"))
         self._transcript.scroll_end(animate=False)
+
+    def _clear_transcript(self) -> None:
+        for child in list(self._transcript.children):
+            child.remove()
+        self._mount_line("[cleared] new conversation started", "dim")
 
     def _set_input_enabled(self, enabled: bool) -> None:
         if self._input is not None:
@@ -383,13 +432,48 @@ class TuiRenderer(App):
     def cancelled(self) -> None:
         self.call_from_thread(self._mount_line, "[cancelled]", "err")
 
+    # ---- slash commands (handled locally, never sent to the agent) ----
+
+    def _handle_slash_command(self, line: str) -> bool:
+        """Run a /command mounted on the UI thread. Returns True if the app
+        should exit (read_line() should stop and return None)."""
+        cmd, _, rest = line[1:].partition(" ")
+        cmd = cmd.strip().lower()
+        rest = rest.strip()
+        if cmd in ("quit", "exit"):
+            self.exit()
+            return True
+        if cmd in ("name", "rename"):
+            if not rest:
+                self._mount_line("usage: /name <text>", "err")
+            else:
+                self.session_name = rest
+                self._refresh_status()
+                self._mount_line(f"session renamed to {rest!r}", "dim")
+        elif cmd == "clear":
+            self._clear_transcript()
+            self._clear_requested.set()
+        elif cmd == "help":
+            self._mount_line(
+                "\n".join(f"/{n} — {d}" for n, d in SLASH_COMMANDS.items()), "dim"
+            )
+        else:
+            self._mount_line(f"unknown command: /{cmd} (try /help)", "err")
+        return False
+
     # ---- input (called from the session worker thread) ----
 
     def read_line(self, prompt: str = "> ") -> str | None:
-        self.call_from_thread(self._set_input_enabled, True)
-        line = self._input_queue.get()
-        self.call_from_thread(self._set_input_enabled, False)
-        if line is None:
-            return None
-        self.call_from_thread(self._mount_user_message, line)
-        return line
+        while True:
+            self.call_from_thread(self._set_input_enabled, True)
+            line = self._input_queue.get()
+            self.call_from_thread(self._set_input_enabled, False)
+            if line is None:
+                return None
+            if line.startswith("/"):
+                should_exit = self.call_from_thread(self._handle_slash_command, line)
+                if should_exit:
+                    return None
+                continue
+            self.call_from_thread(self._mount_user_message, line)
+            return line
