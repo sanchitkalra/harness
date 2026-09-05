@@ -271,6 +271,7 @@ def _unique_log_path(root: Path) -> Path:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Mini coding-agent harness")
+    ap.add_argument("--version", action="version", version="harness 0.1.0")
     ap.add_argument("task", nargs="?", default="", help="task text")
     ap.add_argument("--workspace", default=".", help="workspace root")
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)

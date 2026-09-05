@@ -600,6 +600,15 @@ def test_drive_returns_stopped_api_on_api_error(tmp_path, monkeypatch):
     assert "401" in out or "Unauthorized" in out
 
 
+def test_version_flag(capsys, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["agent", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        agent.main()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "harness 0.1.0" in out
+
+
 def test_stopped_outcomes_logged(tmp_path, monkeypatch):
     import json
     def raise_api(*a, **k):
