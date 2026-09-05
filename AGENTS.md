@@ -6,7 +6,7 @@
 - Bash tool cwd is the workspace root.
 
 ## Layout
-- `agent.py` — orchestration (run loop, sessions, CLI). Re-exports tools/model names so `agent.*` keeps working.
+- `agent.py` — orchestration (run loop, sessions, CLI). Re-exports tools/model names so `agent.*` keeps working. `drive()`'s step budget auto-extends in `STEP_EXTENSION`-sized blocks (15) past `DEFAULT_MAX_STEPS` (30) while the model keeps making real tool calls (not idle), up to `MAX_STEP_CEILING` (100) — a fixed step count otherwise kills a genuinely-still-working task at an arbitrary point. An idle model (no tool calls) still stops via `MAX_IDLE_TURNS` regardless of budget. An explicit `--max-steps` above the ceiling is honored in full, never clamped down.
 - `model.py` — LLM client only. Provider strategy pattern: `resolve_provider()` picks an `OpenAIProvider` or `AnthropicProvider` from env vars (`OPENAI_API_KEY` > `ANTHROPIC_API_KEY` > `MODEL_API_KEY`), then falls back to `model_registry`'s active profile; `llm_call()` delegates to it. `llm_config()` still resolves (base, model, key) for OpenAI-compatible providers specifically. Never prints, never touches files.
 - `model_registry.py` — persisted named `(provider, api_key, model)` profiles at `~/.config/harness/models.json` (mode 600). No Provider classes here (avoids a model.py <-> model_registry.py import cycle) — model.py reads a profile dict and builds the Provider itself.
 - `tools.py` — workspace tools only (`TOOLS`, `resolve`, `tool_*`, `dispatch`). Never prints, never calls the model.

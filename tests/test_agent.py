@@ -98,6 +98,52 @@ def test_run_stops_on_repeated_calls(tmp_path, monkeypatch):
     assert "stopped: no_progress" in agent.run("t", tmp_path, max_steps=6)
 
 
+def _unique_bash_call(n):
+    return _call("bash", {"command": f"echo {n}"}, cid=f"c{n}")
+
+
+def test_default_budget_auto_extends_in_15s_up_to_the_100_ceiling(tmp_path, monkeypatch):
+    """A model that keeps making distinct tool calls (never idle, never
+    repeating) should run past the 30-step default in +15 increments,
+    capped at MAX_STEP_CEILING — not die at step 30."""
+    counter = {"n": 0}
+
+    def busy(*a, **k):
+        counter["n"] += 1
+        return _unique_bash_call(counter["n"])
+
+    monkeypatch.setattr(agent, "llm_call", busy)
+    out = agent.run("t", tmp_path, max_steps=agent.DEFAULT_MAX_STEPS)
+    assert agent.DEFAULT_MAX_STEPS == 30
+    assert agent.MAX_STEP_CEILING == 100
+    assert out == f"stopped: max_steps ({agent.MAX_STEP_CEILING} steps without done)"
+    assert counter["n"] == agent.MAX_STEP_CEILING
+
+
+def test_idle_model_stops_at_default_budget_without_extension(tmp_path, monkeypatch):
+    """Extension only fires when the model is doing real work — an idle
+    model must still stop via MAX_IDLE_TURNS, far short of the ceiling."""
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: {"content": "thinking...", "tool_calls": []})
+    out = agent.run("t", tmp_path, max_steps=agent.DEFAULT_MAX_STEPS)
+    assert out.startswith("stopped: idle")
+    assert f"/{agent.DEFAULT_MAX_STEPS} steps" in out
+
+
+def test_explicit_max_steps_above_ceiling_is_respected_not_clamped(tmp_path, monkeypatch):
+    """An explicit --max-steps above the default ceiling is a deliberate
+    ask and must run in full, not get silently clamped down to 100."""
+    counter = {"n": 0}
+
+    def busy(*a, **k):
+        counter["n"] += 1
+        return _unique_bash_call(counter["n"])
+
+    monkeypatch.setattr(agent, "llm_call", busy)
+    out = agent.run("t", tmp_path, max_steps=150)
+    assert out == "stopped: max_steps (150 steps without done)"
+    assert counter["n"] == 150
+
+
 def _tool_call_ids(messages):
     return {c["id"] for m in messages for c in (m.get("tool_calls") or [])}
 

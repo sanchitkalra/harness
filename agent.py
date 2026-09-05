@@ -35,6 +35,9 @@ from tools import (  # re-exported: tests and callers keep working via agent.*
 )
 
 DEFAULT_MAX_STEPS = 30
+STEP_EXTENSION = 15  # granted when the budget runs out but the model is still making progress
+MAX_STEP_CEILING = 100  # hard ceiling on auto-extension, regardless of --max-steps, so a
+                        # genuinely stuck-but-not-idle loop can't run forever
 MAX_REPEAT_CALLS = 3  # same tool+args this many times -> stop: no_progress
 MAX_IDLE_TURNS = 3  # model replies with no tool call this many times in a row -> stop
 
@@ -142,24 +145,41 @@ def drive(
 
     seen: dict[tuple, int] = {}  # (tool, canonical args) -> times seen; bounded by repeat limit
     idle_turns = 0
-    for step in range(1, max_steps + 1):
+    cap = max_steps
+    # An explicit --max-steps above the default ceiling is a deliberate ask —
+    # respected in full, not clamped down. Below it, auto-extension can grow
+    # the budget up to the ceiling but no further.
+    extension_ceiling = max(max_steps, MAX_STEP_CEILING)
+    step = 0
+    while True:
+        if step >= cap:
+            # Budget exhausted. Extend it instead of giving up if the model
+            # is still doing real work (last turn wasn't idle) — a fixed
+            # step count treats every step as equally valuable, but some
+            # tasks genuinely need more exploration than others.
+            if idle_turns == 0 and cap < extension_ceiling:
+                cap = min(cap + STEP_EXTENSION, extension_ceiling)
+                renderer.step(step, cap, f"[still making progress — extended budget to {cap} steps]")
+            else:
+                return _stop(log_path, step, f"stopped: max_steps ({step} steps without done)")
+        step += 1
         try:
             msg = llm_call(messages, TOOLS)
         except ApiError as e:
-            return _stop(log_path, step, f"stopped: api ({e}, {step}/{max_steps} steps)")
+            return _stop(log_path, step, f"stopped: api ({e}, {step}/{cap} steps)")
         except NetworkError as e:  # network down even after retries: stop, don't crash
-            return _stop(log_path, step, f"stopped: network ({e}, {step}/{max_steps} steps)")
+            return _stop(log_path, step, f"stopped: network ({e}, {step}/{cap} steps)")
         except RuntimeError as e:  # no provider configured — e.g. opened the TUI before /model
             return _stop(log_path, step, f"stopped: no_provider ({e}); configure one with /model or an API key env var")
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
         if text:
-            renderer.step(step, max_steps, text)
+            renderer.step(step, cap, text)
         if not calls:  # model talked without acting: nudge it back to tools
             idle_turns += 1
             if idle_turns >= MAX_IDLE_TURNS:
-                return _stop(log_path, step, f"stopped: idle (no tool call for {idle_turns} turns, {step}/{max_steps} steps)")
+                return _stop(log_path, step, f"stopped: idle (no tool call for {idle_turns} turns, {step}/{cap} steps)")
             messages.append({"role": "user", "content": "Continue: call a tool or done."})
             continue
         idle_turns = 0
@@ -180,7 +200,7 @@ def drive(
                         messages.append({"role": "tool", "tool_call_id": c["id"],
                                          "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); stopping"})
                         _close_dangling_calls(messages, calls[idx + 1:], "skipped: agent stopped before this call ran")
-                        return _stop(log_path, step, f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)")
+                        return _stop(log_path, step, f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{cap} steps)")
                     messages.append({"role": "tool", "tool_call_id": c["id"],
                                      "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
                     continue
@@ -203,7 +223,6 @@ def drive(
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         finally:
             renderer.end_tools()
-    return _stop(log_path, max_steps, f"stopped: max_steps ({max_steps} steps without done)")
 
 
 def _close_dangling_calls(messages: list[dict], skipped_calls: list[dict], reason: str) -> None:
