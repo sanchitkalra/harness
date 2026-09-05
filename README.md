@@ -44,6 +44,7 @@ OpenAI works too: set `OPENAI_API_KEY` (takes precedence) with optional `OPENAI_
 - `tools.py` — `TOOLS`, `resolve()` sandbox, `tool_read / tool_edit / tool_write / tool_bash`, `dispatch()`
 - `ui.py` — terminal rendering (ANSI on tty only); takes plain data, never imports the other modules
 - `agent.py` — `run()` loop, session headers + `--list` / `--fork`, `load_instructions()`, `smoke_test()`, CLI
+- `tui.py` — `TuiRenderer`, a Textual app implementing `ui.Renderer` for interactive mode (`--no-tui` to fall back to plain prints)
 - `smoke_test()` + `tests/` — how to test without spending API calls
 
 Coupling rules: agent talks to the model only via `llm_call(messages, tools)`,
