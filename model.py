@@ -25,6 +25,16 @@ META_DEFAULT_MODEL = "muse-spark-1.1"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-5"
 ANTHROPIC_VERSION = "2023-06-01"
+# Unlike OpenAI-compatible APIs (which default to a large output cap on
+# their own), Anthropic's Messages API requires max_tokens explicitly and
+# it bounds the WHOLE turn — reasoning text plus any tool-call JSON. A task
+# that writes a long file via a single write_file call (e.g. "generate test
+# cases for this PR") can blow past a small budget mid-argument, truncating
+# the tool call's JSON before the content field is ever written — the model
+# then retries with the same truncated shape and the repeat-call guard gives
+# up. 8192 is Claude Sonnet's non-beta output ceiling; raise via
+# ANTHROPIC_MAX_TOKENS if a task still needs more room.
+ANTHROPIC_DEFAULT_MAX_TOKENS = 8192
 
 # Network retry budget (seconds of total backoff sleep). Delays grow
 # exponentially from RETRY_BASE_S, capped at RETRY_CAP_S each.
@@ -247,7 +257,7 @@ class AnthropicProvider:
     base: str = ANTHROPIC_BASE_URL
     model: str = ANTHROPIC_DEFAULT_MODEL
     key: str = ""
-    max_tokens: int = 4096
+    max_tokens: int = ANTHROPIC_DEFAULT_MAX_TOKENS
 
     def call(self, messages: list[dict], tools: list[dict]) -> dict:
         system, anthropic_messages = _to_anthropic_messages(messages)
@@ -294,6 +304,7 @@ def resolve_provider() -> Provider:
             base=os.environ.get("ANTHROPIC_BASE_URL", ANTHROPIC_BASE_URL),
             model=os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_DEFAULT_MODEL),
             key=os.environ["ANTHROPIC_API_KEY"],
+            max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", ANTHROPIC_DEFAULT_MAX_TOKENS)),
         )
     try:
         base, model, key = llm_config()

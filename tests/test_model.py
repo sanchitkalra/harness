@@ -23,7 +23,7 @@ TOOLS = [{"name": "read_file", "description": "read a file", "parameters": {"pat
 KEY_VARS = [
     "OPENAI_API_KEY", "MODEL_API_KEY", "MUSE_SPARK_API_KEY", "META_API_KEY",
     "OPENAI_BASE_URL", "OPENAI_MODEL", "MUSE_SPARK_BASE_URL", "MUSE_SPARK_MODEL",
-    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_MAX_TOKENS",
 ]
 
 
@@ -53,6 +53,20 @@ def test_resolve_provider_anthropic_when_no_openai_key(monkeypatch):
     assert isinstance(p, AnthropicProvider)
     assert p.model == model.ANTHROPIC_DEFAULT_MODEL
     assert p.base == model.ANTHROPIC_BASE_URL
+    # Regression: a too-small max_tokens truncates the JSON of a tool call
+    # that writes a long file (e.g. "generate test cases for this PR") before
+    # the `content` argument is ever written, so the model retries with the
+    # same incomplete call until the repeat-call guard gives up.
+    assert p.max_tokens == model.ANTHROPIC_DEFAULT_MAX_TOKENS
+    assert p.max_tokens >= 8192
+
+
+def test_resolve_provider_anthropic_max_tokens_env_override(monkeypatch):
+    clear_keys(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    monkeypatch.setenv("ANTHROPIC_MAX_TOKENS", "16000")
+    p = resolve_provider()
+    assert p.max_tokens == 16000
 
 
 def test_resolve_provider_anthropic_env_overrides(monkeypatch):
@@ -186,3 +200,6 @@ def test_anthropic_provider_call_round_trip(monkeypatch):
     assert captured["body"]["model"] == "claude-x"
     assert captured["body"]["tools"][0]["name"] == "read_file"
     assert captured["body"]["tools"][0]["input_schema"]["properties"]["path"]["description"] == "file path"
+    # Default provider (no explicit max_tokens) sends the raised default, not
+    # the old 4096 that truncated large tool-call arguments mid-JSON.
+    assert captured["body"]["max_tokens"] == model.ANTHROPIC_DEFAULT_MAX_TOKENS

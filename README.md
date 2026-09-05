@@ -49,7 +49,9 @@ curl -s https://api.meta.ai/v1/models -H "Authorization: Bearer $MODEL_API_KEY" 
 OpenAI works too: set `OPENAI_API_KEY` (takes precedence) with optional `OPENAI_BASE_URL` / `OPENAI_MODEL`.
 
 Anthropic works too: set `ANTHROPIC_API_KEY` (used when `OPENAI_API_KEY` is unset) with optional
-`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` (defaults to `claude-sonnet-4-5`).
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` (defaults to `claude-sonnet-4-5`) / `ANTHROPIC_MAX_TOKENS`
+(defaults to 8192 — raise it if a task needs to generate a lot of output in one tool call, e.g.
+writing a long file; too small a budget truncates the tool call's JSON before it finishes).
 
 Provider precedence: `OPENAI_API_KEY` > `ANTHROPIC_API_KEY` > `MODEL_API_KEY` (Muse Spark)
 > the saved registry (below).
