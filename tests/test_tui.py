@@ -22,7 +22,7 @@ def test_format_status():
 def test_arg_hint():
     assert _arg_hint("read_file", '{"path": "a.txt"}') == "a.txt"
     assert _arg_hint("web_search", '{"query": "foo"}') == "foo"
-    assert _arg_hint("bash", '{"command": "ls"}') == ""
+    assert _arg_hint("bash", '{"command": "ls"}') == "ls"
     assert _arg_hint("read_file", "not json") == ""
 
 
@@ -30,14 +30,16 @@ def test_summarize_batch():
     text, err = summarize_batch([
         ("read_file", "a.py", True),
         ("read_file", "b.py", True),
-        ("bash", "", True),
-        ("bash", "", False),
+        ("bash", "pytest -q", True),
+        ("bash", "pytest -x", False),
     ])
-    assert text == "read 2 files: a.py, b.py · ran 2 commands · 1 error(s)"
+    assert text == "read 2 files: a.py, b.py · ran 2 commands: pytest -q, pytest -x · 1 error(s)"
     assert err is True
     text2, err2 = summarize_batch([("edit_file", "f.py", True)])
     assert text2 == "edited f.py"
     assert err2 is False
+    text3, _ = summarize_batch([("bash", "echo hi", True)])
+    assert text3 == "ran: echo hi"
 
 
 def test_format_file_diff_unified():
@@ -93,6 +95,8 @@ def test_renderer_end_to_end_smoke():
                     "edit_file",
                     "ok: edited f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b",
                 )
+                app.tool_call(1, "bash", '{"command": "pytest -q"}')
+                app.tool_result("bash", "exit=0\nall good")
                 app.end_tools()
                 app.final("done ok")
                 app.update_status(step_count=9, session_id="sess2")
@@ -113,6 +117,10 @@ def test_renderer_end_to_end_smoke():
             assert "done ok" in joined
             # reads collapse behind a summary; edits never do
             assert any("read a.txt" in t for t in texts)
+            # the collapsed summary shows the actual command, not just a count
+            assert any("ran: pytest -q" in t for t in texts)
+            # and expanding it still shows the original tool-call line (the bug: it didn't)
+            assert any("tool: bash" in t and "pytest -q" in t for t in texts)
             assert app.model_name == "test-model"
             assert app.step_count == 9
             assert app.session_id == "sess2"

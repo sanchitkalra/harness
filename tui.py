@@ -49,6 +49,8 @@ def _arg_hint(name: str, args_json: str) -> str:
         return str(args.get("path", ""))
     if name == "web_search":
         return str(args.get("query", ""))
+    if name == "bash":
+        return str(args.get("command", ""))
     return ""
 
 
@@ -61,7 +63,7 @@ def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
     reads: list[str] = []
     edits: list[str] = []
     writes: list[str] = []
-    bashes = 0
+    cmds: list[str] = []
     searches: list[str] = []
     others: dict[str, int] = {}
     errors = 0
@@ -75,7 +77,7 @@ def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
         elif name == "write_file":
             writes.append(hint or "?")
         elif name == "bash":
-            bashes += 1
+            cmds.append(hint or "?")
         elif name == "web_search":
             searches.append(hint or "?")
         elif name == "done":
@@ -97,8 +99,13 @@ def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
         parts.append(files("edited", edits))
     if writes:
         parts.append(files("wrote", writes))
-    if bashes:
-        parts.append("ran 1 command" if bashes == 1 else f"ran {bashes} commands")
+    if cmds:
+        if len(cmds) == 1:
+            parts.append(f"ran: {cmds[0]}"[:80])
+        else:
+            uniq = list(dict.fromkeys(cmds))[:3]
+            more = f" +{len(cmds) - len(uniq)} more" if len(cmds) > 3 else ""
+            parts.append(f"ran {len(cmds)} commands: {', '.join(uniq)}{more}"[:120])
     if searches:
         parts.append(f"searched {searches[0]!r}"[:80] if len(searches) == 1 else f"searched {len(searches)} queries")
     for k, v in others.items():
@@ -286,7 +293,8 @@ class TuiRenderer(App):
 
     def tool_call(self, num: int, name: str, args_json: str) -> None:
         truncated = (args_json or "")[:200].replace("\n", " ")
-        widget = self.call_from_thread(self._mount_line, f"  tool: {name} {truncated}", "tool")
+        call_text = f"  tool: {name} {truncated}"
+        widget = self.call_from_thread(self._mount_line, call_text, "tool")
         if self._batch is not None:
             self._batch.append({
                 "name": name,
@@ -294,7 +302,7 @@ class TuiRenderer(App):
                 "ok": True,
                 "_open": True,
                 "widgets": [widget],
-                "details": [],
+                "details": [("tool", call_text)],
             })
 
     def tool_result(self, tool_name: str, text: str) -> None:
