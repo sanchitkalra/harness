@@ -38,9 +38,14 @@ curl -s https://api.meta.ai/v1/models -H "Authorization: Bearer $MODEL_API_KEY" 
 
 OpenAI works too: set `OPENAI_API_KEY` (takes precedence) with optional `OPENAI_BASE_URL` / `OPENAI_MODEL`.
 
+Anthropic works too: set `ANTHROPIC_API_KEY` (used when `OPENAI_API_KEY` is unset) with optional
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` (defaults to `claude-sonnet-4-5`).
+
+Provider precedence: `OPENAI_API_KEY` > `ANTHROPIC_API_KEY` > `MODEL_API_KEY` (Muse Spark).
+
 ## What's inside (learning map)
 
-- `model.py` — `llm_config()` + `llm_call()`; knows nothing about tools or files
+- `model.py` — `resolve_provider()` picks a `Provider` strategy (`OpenAIProvider` / `AnthropicProvider`) from env vars; `llm_call()` calls it. Knows nothing about tools or files. Add a provider by writing a class with `model` + `call(messages, tools)` and wiring it into `resolve_provider()`.
 - `tools.py` — `TOOLS`, `resolve()` sandbox, `tool_read / tool_edit / tool_write / tool_bash`, `dispatch()`
 - `ui.py` — terminal rendering (ANSI on tty only); takes plain data, never imports the other modules
 - `agent.py` — `run()` loop, session headers + `--list` / `--fork`, `load_instructions()`, `smoke_test()`, CLI

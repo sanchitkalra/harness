@@ -7,7 +7,7 @@
 
 ## Layout
 - `agent.py` — orchestration (run loop, sessions, CLI). Re-exports tools/model names so `agent.*` keeps working.
-- `model.py` — LLM client only (`llm_config`, `llm_call`). Never prints, never touches files.
+- `model.py` — LLM client only. Provider strategy pattern: `resolve_provider()` picks an `OpenAIProvider` or `AnthropicProvider` from env vars (`OPENAI_API_KEY` > `ANTHROPIC_API_KEY` > `MODEL_API_KEY`); `llm_call()` delegates to it. `llm_config()` still resolves (base, model, key) for OpenAI-compatible providers specifically. Never prints, never touches files.
 - `tools.py` — workspace tools only (`TOOLS`, `resolve`, `tool_*`, `dispatch`). Never prints, never calls the model.
 - `ui.py` — terminal rendering only. Takes plain data, never imports model/tools internals.
 - `tui.py` — Textual-based interactive TUI (`TuiRenderer`); implements the same `ui.Renderer` protocol plus `read_line`/`update_status`. Renderer methods run on a worker thread and marshal onto the UI thread via `call_from_thread`.

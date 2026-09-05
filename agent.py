@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ui
-from model import ApiError, NetworkError, llm_call, llm_config
+from model import ApiError, NetworkError, llm_call, llm_config, resolve_provider
 from tools import (  # re-exported: tests and callers keep working via agent.*
     MAX_OUTPUT_CHARS,
     TOOLS,
@@ -118,8 +118,7 @@ def drive(
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _base, _model, _key = llm_config()
-            model_name = _model
+            model_name = resolve_provider().model
         except Exception:
             model_name = "unknown"
         # Derive task for header from last user message, else empty
@@ -330,7 +329,7 @@ def main() -> None:
         context_line = f"Forked from session {parent_id_for_header}: task={parent_task!r} steps={step_count}"
         task_text = context_line + "\n" + task_text
     try:
-        llm_config()
+        resolve_provider()
     except RuntimeError as e:
         ap.error(f"{e} (or use --smoke for the no-API check)")
 
@@ -347,7 +346,7 @@ def main() -> None:
             try:
                 import tui as tui_mod  # local
                 try:
-                    _, model_name, _ = llm_config()
+                    model_name = resolve_provider().model
                 except Exception:
                     model_name = "unknown"
                 renderer = tui_mod.TuiRenderer(model_name=model_name, session_id=parent_id_for_header or "")

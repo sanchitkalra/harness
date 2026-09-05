@@ -1,6 +1,7 @@
 """Unit tests for the harness itself (no API key needed)."""
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,10 +152,10 @@ def test_session_header_roundtrip(tmp_path, monkeypatch):
     # check model value when env gives default muse model
     assert header["model"] == "muse-spark-1.1"
 
-    # now test fallback to unknown when llm_config fails
+    # now test fallback to unknown when provider resolution fails
     def fail_config():
         raise RuntimeError("no key")
-    monkeypatch.setattr(agent, "llm_config", fail_config)
+    monkeypatch.setattr(agent, "resolve_provider", fail_config)
     log_path2 = tmp_path / "sessions" / "20240101-000001.jsonl"
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "ok2"}))
     agent.run("another task", tmp_path, max_steps=3, log_path=log_path2)
@@ -235,7 +236,7 @@ def test_main_fork_cli(tmp_path, monkeypatch, capsys):
         '{"step":1}\n{"step":2}\n'
     )
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "forked ok"}))
-    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
     monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "--fork", parent_id, "continue work"])
     agent.main()
     # find child session (different from parent)
@@ -511,7 +512,7 @@ def test_drive_two_turns_shared_history(tmp_path, monkeypatch):
 
 def test_interactive_bare_eof_exits_without_drive(tmp_path, monkeypatch):
     """bare -i: input EOF immediately → exits without calling drive."""
-    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
     calls = []
 
     def fake_drive(*a, **k):
@@ -527,7 +528,7 @@ def test_interactive_bare_eof_exits_without_drive(tmp_path, monkeypatch):
 
 def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
     """-i with a task: runs drive once for initial task, then EOF exits."""
-    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
     calls = []
 
     def fake_drive(*a, **k):
