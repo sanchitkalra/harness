@@ -199,7 +199,7 @@ def test_session_header_roundtrip(tmp_path, monkeypatch):
     assert header2["workspace"] == str(tmp_path)
 
 
-def test_load_instructions_precedence_and_truncation(tmp_path):
+def test_load_instructions_precedence_and_no_truncation(tmp_path):
     # empty -> ""
     assert agent.load_instructions(tmp_path) == ""
     # CLAUDE.md fallback
@@ -208,9 +208,9 @@ def test_load_instructions_precedence_and_truncation(tmp_path):
     # AGENTS.md wins over CLAUDE.md
     (tmp_path / "AGENTS.md").write_text("from agents")
     assert agent.load_instructions(tmp_path) == "from agents"
-    # truncates to 2000 chars
+    # no cap: a large file comes back whole
     (tmp_path / "AGENTS.md").write_text("x" * 5000)
-    assert len(agent.load_instructions(tmp_path)) == 2000
+    assert len(agent.load_instructions(tmp_path)) == 5000
 
 
 def test_run_injects_instructions(tmp_path, monkeypatch):
@@ -589,15 +589,13 @@ def test_load_memory_in_system_prompt(tmp_path):
     assert "durable fact: cats" in sys_msg
 
 
-def test_load_memory_truncation(tmp_path):
+def test_load_memory_not_truncated(tmp_path):
     long_text = "x" * 5000
     (tmp_path / "MEMORY.md").write_text(long_text, encoding="utf-8")
     mem = agent.load_memory(tmp_path)
-    assert len(mem) == 2000
-    assert mem == long_text[:2000]
+    assert mem == long_text
     msgs = agent.new_conversation("hi", tmp_path)
-    assert long_text[:2000] in msgs[0]["content"]
-    assert long_text[2000:] not in msgs[0]["content"]
+    assert long_text in msgs[0]["content"]
 
 
 def test_llm_call_surfaces_status_code(monkeypatch):

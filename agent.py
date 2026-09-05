@@ -55,8 +55,7 @@ def load_instructions(root: Path) -> str:
         p = root / name
         try:
             if p.is_file():
-                text = p.read_text(encoding="utf-8")
-                return text[:2000]
+                return p.read_text(encoding="utf-8")
         except Exception:
             continue
     return ""
@@ -66,8 +65,7 @@ def load_memory(root: Path) -> str:
     p = root / "MEMORY.md"
     try:
         if p.is_file():
-            text = p.read_text(encoding="utf-8")
-            return text[:2000]
+            return p.read_text(encoding="utf-8")
     except Exception:
         pass
     return ""
