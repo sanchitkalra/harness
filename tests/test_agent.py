@@ -622,3 +622,41 @@ def test_stopped_outcomes_logged(tmp_path, monkeypatch):
     last = entries[-1]
     assert last["tool"] == "stopped"
     assert last["result"].startswith("stopped: api")
+
+
+def test_skills_loader(tmp_path):
+    assert agent.load_skills(tmp_path) == {}
+    d = tmp_path / "skills" / "commit"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        '---\nname: commit\ndescription: write commits\n---\n\n# Body\n', encoding="utf-8")
+    skills = agent.load_skills(tmp_path)
+    assert set(skills) == {"commit"}
+    assert skills["commit"]["description"] == "write commits"
+    assert "# Body" in skills["commit"]["body"]
+    # dir without SKILL.md ignored; dir name is fallback for missing frontmatter name
+    (tmp_path / "skills" / "empty").mkdir()
+    (tmp_path / "skills" / "noname").mkdir()
+    (tmp_path / "skills" / "noname" / "SKILL.md").write_text("just body", encoding="utf-8")
+    skills = agent.load_skills(tmp_path)
+    assert set(skills) == {"commit", "noname"}
+
+
+def test_read_skill_dispatch(tmp_path):
+    assert "missing_arg" in agent.dispatch(tmp_path, "read_skill", {})
+    assert "unknown_skill" in agent.dispatch(tmp_path, "read_skill", {"name": "nope"})
+    d = tmp_path / "skills" / "commit"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text('---\nname: commit\ndescription: x\n---\n\nDo commits.', encoding="utf-8")
+    assert "Do commits." in agent.dispatch(tmp_path, "read_skill", {"name": "commit"})
+
+
+def test_new_conversation_lists_skills(tmp_path):
+    msgs = agent.new_conversation("hi", tmp_path)
+    assert "Available skills" not in msgs[0]["content"]
+    d = tmp_path / "skills" / "commit"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text('---\nname: commit\ndescription: write commits\n---\n\nBody', encoding="utf-8")
+    msgs = agent.new_conversation("hi", tmp_path)
+    assert "Available skills" in msgs[0]["content"]
+    assert "- commit: write commits" in msgs[0]["content"]

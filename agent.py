@@ -23,9 +23,11 @@ from tools import (  # re-exported: tests and callers keep working via agent.*
     MAX_OUTPUT_CHARS,
     TOOLS,
     dispatch,
+    load_skills,
     tool_bash,
     tool_edit,
     tool_read,
+    tool_read_skill,
     tool_search,
     tool_write,
     truncate,
@@ -77,6 +79,20 @@ def new_conversation(task: str, root: Path) -> list[dict]:
     sys_content = SYSTEM + (f"\n\nWorkspace instructions:\n{instr}" if instr else "")
     if mem:
         sys_content += f"\n\nLong-term memory:\n{mem}"
+    try:
+        skills = load_skills(root)
+        if skills:
+            lines = []
+            for name in sorted(skills.keys()):
+                desc = skills[name].get("description", "")
+                if desc:
+                    lines.append(f"- {name}: {desc}")
+                else:
+                    lines.append(f"- {name}")
+            skills_block = "\n".join(lines)
+            sys_content += f"\n\nAvailable skills (use read_skill to load full instructions):\n{skills_block}"
+    except Exception:
+        pass
     messages: list[dict] = [
         {"role": "system", "content": sys_content},
     ]

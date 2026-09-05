@@ -52,6 +52,11 @@ TOOLS = [
         "parameters": {"query": "search terms, e.g. 'python programming'", "limit": "optional max results (default 5)"},
     },
     {
+        "name": "read_skill",
+        "description": "Read a skill's full SKILL.md by name. Returns the skill file content. Use this to load detailed instructions for an available skill.",
+        "parameters": {"name": "skill name, e.g. 'commit'"},
+    },
+    {
         "name": "done",
         "description": "Call when the task is complete. Summarise what changed.",
         "parameters": {"summary": "short result for the user"},
@@ -94,7 +99,6 @@ def _unified_diff(old_text: str, new_text: str, path: str, max_lines: int = 200,
         diff_lines.append(f"... [truncated {remaining} lines]")
     text = "\n".join(diff_lines)
     if len(text) > max_chars:
-        # slice then annotate using overflow length
         overflow = len(text) - max_chars
         text = text[:max_chars] + f"\n... [truncated {overflow} chars]"
     return text
@@ -139,7 +143,7 @@ def tool_read(root: Path, path: str, offset: int = 0, limit: int = 200) -> str:
     else:
         shown = f"lines {off + 1}-{off} of {total} (past end)"
     body = "\n".join(page)
-    if len(body) > MAX_OUTPUT_CHARS:  # very long lines: char-cap the page, keep it recoverable
+    if len(body) > MAX_OUTPUT_CHARS:
         body = body[:MAX_OUTPUT_CHARS] + f"\n... [truncated {len(body) - MAX_OUTPUT_CHARS} chars; re-read with a smaller limit]"
     out = f"{shown}\n{body}"
     if off + lim < total:
@@ -249,13 +253,122 @@ def tool_search(root: Path, query: str, limit: int = 5) -> str:
     for r in results:
         title = r.get("title", "")
         snippet_html = r.get("snippet", "")
-        # strip html tags from snippet
         snippet_text = re.sub(r"<[^>]+>", "", snippet_html)
         snippet_text = html.unescape(snippet_text)
         article_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
         lines.append(f"Title: {title}\nSnippet: {snippet_text}\nURL: {article_url}")
     out = "\n\n".join(lines)
     return truncate(out)
+
+
+# --- Skills support ---
+
+def _parse_skill_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML-like frontmatter delimited by ---.
+
+    Returns (metadata dict, body string). If no frontmatter, metadata empty
+    and body is original text.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.splitlines()
+    if len(lines) < 3:
+        return {}, text
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return {}, text
+    fm_lines = lines[1:end_idx]
+    body = "\n".join(lines[end_idx + 1 :])
+    meta: dict[str, str] = {}
+    for ln in fm_lines:
+        if not ln.strip():
+            continue
+        if ":" not in ln:
+            continue
+        key, val = ln.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+            val = val[1:-1]
+        meta[key] = val
+    return meta, body
+
+
+def load_skills(root: Path) -> dict:
+    """Read skills/<name>/SKILL.md at startup.
+
+    Returns dict mapping skill name -> {name, description, content, body, path}.
+    Missing skills dir returns empty dict.
+    Frontmatter with name and description is parsed; directory name is fallback for name.
+    """
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return {}
+    result: dict = {}
+    for entry in skills_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        skill_file = entry / "SKILL.md"
+        if not skill_file.is_file():
+            continue
+        try:
+            raw = skill_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        meta, body = _parse_skill_frontmatter(raw)
+        name = meta.get("name") or entry.name
+        desc = meta.get("description") or ""
+        if not name:
+            continue
+        result[name] = {
+            "name": name,
+            "description": desc,
+            "content": raw,
+            "body": body,
+            "path": str(skill_file.relative_to(root)) if skill_file.is_relative_to(root) else str(skill_file),
+        }
+    # Also discover any nested SKILL.md files under skills/
+    try:
+        for p in skills_dir.rglob("SKILL.md"):
+            if not p.is_file():
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            meta, body = _parse_skill_frontmatter(raw)
+            parent = p.parent.name
+            name = meta.get("name") or parent
+            if name in result:
+                continue
+            desc = meta.get("description") or ""
+            if not name:
+                continue
+            result[name] = {
+                "name": name,
+                "description": desc,
+                "content": raw,
+                "body": body,
+                "path": str(p.relative_to(root)) if p.is_relative_to(root) else str(p),
+            }
+    except Exception:
+        pass
+    return result
+
+
+def tool_read_skill(root: Path, name: str) -> str:
+    if not (name or "").strip():
+        return "error: missing_arg: 'name' is required, e.g. {'name': 'commit'}"
+    skills = load_skills(root)
+    if name not in skills:
+        available = ", ".join(sorted(skills.keys())) if skills else "none"
+        return f"error: unknown_skill: {name!r} not found; available skills: {available}"
+    skill = skills[name]
+    return truncate(skill["content"])
 
 
 def dispatch(root: Path, name: str, args: dict) -> str:
@@ -280,6 +393,10 @@ def dispatch(root: Path, name: str, args: dict) -> str:
         if "query" not in args or not str(args.get("query", "")).strip():
             return "error: missing_arg: 'query' is required, e.g. {'query': 'python programming'}"
         return tool_search(root, args.get("query", ""), args.get("limit", 5))
+    if name == "read_skill":
+        if "name" not in args or not str(args.get("name", "")).strip():
+            return "error: missing_arg: 'name' is required, e.g. {'name': 'commit'}"
+        return tool_read_skill(root, args.get("name", ""))
     if name == "done":
         return "done"
     valid = ", ".join(t["name"] for t in TOOLS)
