@@ -7,6 +7,9 @@ dependencies = ["textual>=0.60"]
 [project.scripts]
 harness = "agent:main"
 
+[tool.setuptools]
+py-modules = ["agent", "model", "model_registry", "tools", "ui", "tui"]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 
