@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import queue
 import re
+import threading
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -212,6 +213,13 @@ class TuiRenderer(App):
         self._transcript: VerticalScroll | None = None
         self._status: Static | None = None
         self._input: Input | None = None
+        # Set once the app's event loop is actually running — call_from_thread
+        # raises if invoked before this, so the session worker thread must
+        # wait on it before touching any Renderer method.
+        self._loop_ready = threading.Event()
+
+    def wait_until_ready(self, timeout: float | None = None) -> None:
+        self._loop_ready.wait(timeout)
 
     # ---- Textual app ----
 
@@ -226,6 +234,7 @@ class TuiRenderer(App):
         self._input = self.query_one("#input", Input)
         self._refresh_status()
         self._input.focus()
+        self._loop_ready.set()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value

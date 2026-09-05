@@ -427,10 +427,17 @@ def main() -> None:
 
         if use_tui:
             def worker() -> None:
+                # Wait for the app's event loop to actually be running —
+                # call_from_thread (used by every Renderer method) raises
+                # if invoked any earlier.
+                renderer.wait_until_ready(timeout=10)
                 try:
                     run_interactive_session()
                 finally:
-                    renderer.call_from_thread(renderer.exit)
+                    try:
+                        renderer.call_from_thread(renderer.exit)
+                    except Exception:
+                        pass  # app may already be exiting (e.g. Ctrl-C from the UI thread)
 
             t = threading.Thread(target=worker, daemon=True)
             t.start()
