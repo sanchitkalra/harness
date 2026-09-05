@@ -272,10 +272,22 @@ class AnthropicProvider:
         return _from_anthropic_message(raw)
 
 
-def resolve_provider() -> Provider:
-    """Pick a Provider strategy from env vars: OpenAI > Anthropic > Muse Spark.
+def _provider_from_profile(profile: dict) -> Provider:
+    provider = profile.get("provider")
+    key = profile.get("api_key", "")
+    base = profile.get("base_url") or None
+    if provider == "anthropic":
+        return AnthropicProvider(base=base or ANTHROPIC_BASE_URL, model=profile.get("model") or ANTHROPIC_DEFAULT_MODEL, key=key)
+    return OpenAIProvider(base=base or "https://api.openai.com/v1", model=profile.get("model") or "gpt-4o-mini", key=key)
 
-    Raises RuntimeError (via llm_config) if nothing is configured.
+
+def resolve_provider() -> Provider:
+    """Pick a Provider strategy: env vars (OpenAI > Anthropic > Muse Spark)
+    first, then the persisted registry's active profile (see
+    model_registry.py — set via /model in the TUI, or by hand-editing
+    ~/.config/harness/models.json).
+
+    Raises RuntimeError if nothing is configured either way.
     """
     if not os.environ.get("OPENAI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY"):
         return AnthropicProvider(
@@ -283,8 +295,15 @@ def resolve_provider() -> Provider:
             model=os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_DEFAULT_MODEL),
             key=os.environ["ANTHROPIC_API_KEY"],
         )
-    base, model, key = llm_config()
-    return OpenAIProvider(base, model, key)
+    try:
+        base, model, key = llm_config()
+        return OpenAIProvider(base, model, key)
+    except RuntimeError:
+        import model_registry
+        profile = model_registry.get_active_profile()
+        if profile is None:
+            raise
+        return _provider_from_profile(profile)
 
 
 def llm_call(messages: list[dict], tools: list[dict]) -> dict:

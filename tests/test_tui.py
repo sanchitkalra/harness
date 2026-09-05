@@ -5,11 +5,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
 from rich.text import Text
-from textual.widgets import Collapsible, Static
+from textual.widgets import Collapsible, Input, Select, Static
 
+import model_registry as mr
 import tui
 from tui import TuiRenderer, _arg_hint, format_file_diff, format_status, summarize_batch
+
+
+@pytest.fixture(autouse=True)
+def isolated_registry(tmp_path, monkeypatch):
+    """Never let a real ~/.config/harness/models.json leak into these tests."""
+    monkeypatch.setenv("HARNESS_CONFIG_DIR", str(tmp_path))
 
 
 def test_format_status():
@@ -259,5 +267,97 @@ def test_hints_show_and_filter_while_typing_a_slash_command():
             await pilot.press(" ")  # space: now typing the argument, hide hints
             await pilot.pause()
             assert "visible" not in app._hints.classes
+
+    asyncio.run(body())
+
+
+def test_slash_model_add_new_profile_and_it_becomes_active():
+    async def body():
+        app = TuiRenderer(model_name="unknown", session_id="sess1")
+        async with app.run_test(size=(90, 30)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, tui.ModelPickerScreen)
+
+            # no saved profiles yet: only "+ Add new profile..." is offered
+            select = app.screen.query_one("#picker-select", Select)
+            select.value = "__add__"
+            await pilot.pause()
+            assert "visible" in app.screen.query_one("#add-form").classes
+
+            app.screen.query_one("#f-name", Input).value = "work"
+            app.screen.query_one("#f-provider", Select).value = "anthropic"
+            app.screen.query_one("#f-key", Input).value = "sk-ant-testkey"
+            app.screen.query_one("#f-model", Input).value = "claude-sonnet-5"
+            await pilot.click("#f-save")
+            await pilot.pause()
+
+            assert not isinstance(app.screen, tui.ModelPickerScreen)  # modal closed
+            reg = mr.load_registry()
+            assert reg["active"] == "work"
+            assert reg["profiles"]["work"]["provider"] == "anthropic"
+            texts = _static_texts(app)
+            assert any("model set to 'work'" in t for t in texts)
+            assert "session: sess1" in app._status.content.plain
+            assert app.model_name == "claude-sonnet-5"
+
+    asyncio.run(body())
+
+
+def test_slash_model_save_rejects_missing_fields():
+    async def body():
+        app = TuiRenderer(model_name="unknown", session_id="sess1")
+        async with app.run_test(size=(90, 30)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            app.screen.query_one("#picker-select", Select).value = "__add__"
+            await pilot.pause()
+            await pilot.click("#f-save")  # nothing filled in
+            await pilot.pause()
+            assert isinstance(app.screen, tui.ModelPickerScreen)  # still open
+            screen_texts = [
+                w.content.plain if isinstance(w.content, Text) else str(w.content)
+                for w in app.screen.query(Static)
+            ]
+            assert any("required" in t for t in screen_texts)
+            assert mr.load_registry()["profiles"] == {}
+
+    asyncio.run(body())
+
+
+def test_slash_model_picks_existing_profile():
+    async def body():
+        mr.add_profile("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
+        mr.add_profile("cheap", "openai", "sk-oai", "gpt-4o-mini", make_active=False)
+        app = TuiRenderer(model_name="unknown", session_id="sess1")
+        async with app.run_test(size=(90, 30)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            select = app.screen.query_one("#picker-select", Select)
+            select.value = "cheap"
+            await pilot.pause()
+
+            assert mr.load_registry()["active"] == "cheap"
+            assert any("model set to 'cheap'" in t for t in _static_texts(app))
+            assert app.model_name == "gpt-4o-mini"
+
+    asyncio.run(body())
+
+
+def test_slash_model_cancel_leaves_registry_untouched():
+    async def body():
+        mr.add_profile("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
+        app = TuiRenderer(model_name="unknown", session_id="sess1")
+        async with app.run_test(size=(90, 30)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, tui.ModelPickerScreen)
+            assert mr.load_registry()["active"] == "work"  # unchanged
 
     asyncio.run(body())

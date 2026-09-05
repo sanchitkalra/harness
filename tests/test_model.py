@@ -6,7 +6,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 import model
+import model_registry as mr
 from model import (
     AnthropicProvider,
     OpenAIProvider,
@@ -27,6 +30,12 @@ KEY_VARS = [
 def clear_keys(monkeypatch):
     for v in KEY_VARS:
         monkeypatch.delenv(v, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolated_registry(tmp_path, monkeypatch):
+    """Never let a real ~/.config/harness/models.json leak into these tests."""
+    monkeypatch.setenv("HARNESS_CONFIG_DIR", str(tmp_path))
 
 
 def test_resolve_provider_prefers_openai(monkeypatch):
@@ -65,10 +74,36 @@ def test_resolve_provider_falls_back_to_muse(monkeypatch):
 
 
 def test_resolve_provider_raises_when_nothing_configured(monkeypatch):
-    import pytest
     clear_keys(monkeypatch)
     with pytest.raises(RuntimeError):
         resolve_provider()
+
+
+def test_resolve_provider_falls_back_to_registry_when_no_env_vars(monkeypatch):
+    clear_keys(monkeypatch)
+    mr.add_profile("work", "anthropic", "sk-ant-xyz", "claude-sonnet-5")
+    p = resolve_provider()
+    assert isinstance(p, AnthropicProvider)
+    assert p.model == "claude-sonnet-5"
+    assert p.key == "sk-ant-xyz"
+
+
+def test_resolve_provider_env_vars_win_over_registry(monkeypatch):
+    clear_keys(monkeypatch)
+    mr.add_profile("work", "anthropic", "sk-ant-xyz", "claude-sonnet-5")
+    monkeypatch.setenv("MODEL_API_KEY", "k")
+    p = resolve_provider()
+    assert isinstance(p, OpenAIProvider)
+    assert p.model == "muse-spark-1.1"
+
+
+def test_resolve_provider_registry_openai_profile(monkeypatch):
+    clear_keys(monkeypatch)
+    mr.add_profile("cheap", "openai", "sk-oai", "gpt-4o-mini")
+    p = resolve_provider()
+    assert isinstance(p, OpenAIProvider)
+    assert p.model == "gpt-4o-mini"
+    assert p.key == "sk-oai"
 
 
 def test_to_anthropic_messages_extracts_system_and_merges_tool_results():

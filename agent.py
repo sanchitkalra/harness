@@ -149,6 +149,8 @@ def drive(
             return _stop(log_path, step, f"stopped: api ({e}, {step}/{max_steps} steps)")
         except NetworkError as e:  # network down even after retries: stop, don't crash
             return _stop(log_path, step, f"stopped: network ({e}, {step}/{max_steps} steps)")
+        except RuntimeError as e:  # no provider configured — e.g. opened the TUI before /model
+            return _stop(log_path, step, f"stopped: no_provider ({e}); configure one with /model or an API key env var")
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
@@ -346,19 +348,23 @@ def main() -> None:
             step_count = 0
         context_line = f"Forked from session {parent_id_for_header}: task={parent_task!r} steps={step_count}"
         task_text = context_line + "\n" + task_text
+    will_use_tui = False
+    if args.interactive and not args.no_tui:
+        try:
+            will_use_tui = sys.stdout.isatty()
+        except Exception:
+            will_use_tui = False
     try:
         resolve_provider()
     except RuntimeError as e:
-        ap.error(f"{e} (or use --smoke for the no-API check)")
+        # The TUI has a /model command to configure a provider after opening,
+        # so let it start unconfigured; every other mode has no such escape
+        # hatch and should fail fast instead of crashing on the first call.
+        if not will_use_tui:
+            ap.error(f"{e} (or use --smoke for the no-API check)")
 
     if args.interactive:
-        use_tui = False
-        if not args.no_tui:
-            try:
-                use_tui = sys.stdout.isatty()
-            except Exception:
-                use_tui = False
-
+        use_tui = will_use_tui
         renderer = None
         if use_tui:
             try:

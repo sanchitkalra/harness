@@ -20,8 +20,11 @@ import threading
 
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
-from textual.widgets import Collapsible, Input, Static
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Collapsible, Input, Select, Static
+
+import model_registry
 
 # ----------------------------------------------------------------------
 # Pure helpers (no Textual/UI imports) — reused by TuiRenderer.
@@ -125,6 +128,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "name": "rename this session (shown in the status bar)",
     "rename": "alias for /name",
     "clear": "clear the transcript and start a new conversation",
+    "model": "pick or add a saved model profile",
     "quit": "exit the app",
     "exit": "alias for /quit",
 }
@@ -192,6 +196,82 @@ def format_file_diff(diff_lines: list[str], path_hint: str = "") -> tuple[str, s
     else:
         stat = f"Added {_plural(added, 'line')}, removed {_plural(removed, 'line')}"
     return filename, stat, styled
+
+
+# ----------------------------------------------------------------------
+# ModelPickerScreen — /model: pick a saved profile, or add a new one
+# ----------------------------------------------------------------------
+
+class ModelPickerScreen(ModalScreen[str | None]):
+    """Dismisses with the newly-active profile name, or None if cancelled."""
+
+    CSS = """
+    ModelPickerScreen { align: center middle; }
+    #picker-box { width: 64; height: auto; border: round $accent; padding: 1 2; background: $panel; }
+    #picker-box Input, #picker-box Select { margin-bottom: 1; }
+    #add-form { display: none; }
+    #add-form.visible { display: block; }
+    .picker-err { color: $error; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        reg = model_registry.load_registry()
+        self._profiles = reg["profiles"]
+        self._active = reg.get("active")
+
+    def compose(self) -> ComposeResult:
+        options = [
+            (f"{name} — {p.get('provider')}/{p.get('model')}" + (" (current)" if name == self._active else ""), name)
+            for name, p in self._profiles.items()
+        ]
+        options.append(("+ Add new profile...", "__add__"))
+        # Deliberately no pre-selected value: Select fires Changed on mount
+        # for any non-blank initial value, which on_select_changed below
+        # would treat as a real pick and dismiss the screen immediately.
+        with Vertical(id="picker-box"):
+            yield Static("Model profiles — enter to select, esc to cancel")
+            yield Select(options, id="picker-select", allow_blank=True)
+            with Vertical(id="add-form"):
+                yield Input(placeholder="name (e.g. work)", id="f-name")
+                yield Select(
+                    [(p, p) for p in model_registry.PROVIDERS], prompt="provider", id="f-provider"
+                )
+                yield Input(placeholder="API key", password=True, id="f-key")
+                yield Input(placeholder="model (e.g. claude-sonnet-5)", id="f-model")
+                yield Input(placeholder="base url (optional)", id="f-base")
+                yield Button("Save", id="f-save", variant="primary")
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "picker-select":
+            return
+        if event.value == "__add__":
+            self.query_one("#add-form").add_class("visible")
+            self.query_one("#f-name", Input).focus()
+        elif event.value is not Select.BLANK:
+            model_registry.set_active(event.value)
+            self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "f-save":
+            return
+        name = self.query_one("#f-name", Input).value.strip()
+        provider = self.query_one("#f-provider", Select).value
+        api_key = self.query_one("#f-key", Input).value.strip()
+        model_name = self.query_one("#f-model", Input).value.strip()
+        base_url = self.query_one("#f-base", Input).value.strip() or None
+        box = self.query_one("#picker-box")
+        for old in box.query(".picker-err"):
+            old.remove()
+        if not name or provider is Select.BLANK or not api_key or not model_name:
+            box.mount(Static("name, provider, API key, and model are required", classes="picker-err"))
+            return
+        model_registry.add_profile(name, provider, api_key, model_name, base_url)
+        self.dismiss(name)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ----------------------------------------------------------------------
@@ -437,6 +517,14 @@ class TuiRenderer(App):
 
     # ---- slash commands (handled locally, never sent to the agent) ----
 
+    def _on_model_picked(self, name: str | None) -> None:
+        if name is None:
+            return
+        profile = model_registry.load_registry()["profiles"].get(name, {})
+        self.model_name = profile.get("model") or self.model_name
+        self._refresh_status()
+        self._mount_line(f"model set to {name!r} ({profile.get('provider')}/{profile.get('model')})", "dim")
+
     def _handle_slash_command(self, line: str) -> bool:
         """Run a /command mounted on the UI thread. Returns True if the app
         should exit (read_line() should stop and return None)."""
@@ -456,6 +544,8 @@ class TuiRenderer(App):
         elif cmd == "clear":
             self._clear_transcript()
             self._clear_requested.set()
+        elif cmd == "model":
+            self.push_screen(ModelPickerScreen(), self._on_model_picked)
         elif cmd == "help":
             self._mount_line(
                 "\n".join(f"/{n} — {d}" for n, d in SLASH_COMMANDS.items()), "dim"

@@ -452,6 +452,18 @@ def test_run_returns_stopped_on_network_failure(tmp_path, monkeypatch):
     assert out.startswith("stopped: network")
 
 
+def test_run_returns_stopped_when_no_provider_configured(tmp_path, monkeypatch):
+    """Opening the TUI unconfigured (see /model) must not crash on first
+    submit — drive() turns the RuntimeError into a friendly stop message."""
+    def boom(*a, **k):
+        raise RuntimeError("set MODEL_API_KEY (Muse Spark), OPENAI_API_KEY, or ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(agent, "llm_call", boom)
+    out = agent.run("t", tmp_path, max_steps=3)
+    assert out.startswith("stopped: no_provider")
+    assert "/model" in out
+
+
 def test_web_search_retries_then_succeeds(tmp_path, monkeypatch):
     import urllib.request as _urllib_req
 
@@ -575,6 +587,56 @@ def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i", "do thing"])
     agent.main()
     assert len(calls) == 1
+
+
+def test_interactive_tui_opens_even_when_unconfigured(tmp_path, monkeypatch):
+    """The TUI has /model to configure a provider after opening, so -i on a
+    tty should NOT hard-exit before even starting — unlike every other mode
+    (--no-tui, non-interactive), which has no such escape hatch."""
+    import threading
+    import types
+
+    def always_unconfigured():
+        raise RuntimeError("no key")
+
+    monkeypatch.setattr(agent, "resolve_provider", always_unconfigured)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    class FakeRenderer:
+        def __init__(self, model_name="unknown", session_id=""):
+            self.model_name = model_name
+            self._exit_event = threading.Event()
+
+        def wait_until_ready(self, timeout=None):
+            pass
+
+        def call_from_thread(self, fn, *a, **k):
+            return fn(*a, **k)
+
+        def read_line(self, prompt="> "):
+            return None  # simulate immediate EOF
+
+        def take_clear_request(self):
+            return False
+
+        def update_status(self, **kw):
+            pass
+
+        def final(self, s):
+            pass
+
+        def cancelled(self):
+            pass
+
+        def exit(self):
+            self._exit_event.set()
+
+        def run(self):
+            self._exit_event.wait(timeout=2)
+
+    monkeypatch.setitem(sys.modules, "tui", types.SimpleNamespace(TuiRenderer=FakeRenderer))
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i"])
+    agent.main()  # must not raise SystemExit via ap.error
 
 
 def test_load_memory_missing(tmp_path):
