@@ -423,7 +423,10 @@ class TuiRenderer(App):
 
     def step(self, num: int, total: int, text: str) -> None:
         self.step_count = num
-        self.call_from_thread(self._mount_line, f"Step {num}/{total} {(text or '').strip()}", "step")
+        self.call_from_thread(self._mount_line, f"Step {num}/{total}", "step")
+        stripped = (text or "").strip()
+        if stripped:
+            self.call_from_thread(self._mount_line, stripped)
         self.call_from_thread(self._refresh_status)
 
     def final(self, summary: str) -> None:
