@@ -98,6 +98,41 @@ def test_run_stops_on_repeated_calls(tmp_path, monkeypatch):
     assert "stopped: no_progress" in agent.run("t", tmp_path, max_steps=6)
 
 
+def _tool_call_ids(messages):
+    return {c["id"] for m in messages for c in (m.get("tool_calls") or [])}
+
+
+def _tool_result_ids(messages):
+    return {m["tool_call_id"] for m in messages if m.get("role") == "tool"}
+
+
+def test_done_alongside_other_calls_still_answers_every_tool_use(tmp_path, monkeypatch):
+    """Every tool_use in a turn must get a matching tool_result — even calls
+    skipped because `done` cut the batch short — or a strict provider
+    (Anthropic) rejects the history on the very next turn."""
+    import json as _j
+
+    msg = {"content": "", "tool_calls": [
+        {"id": "c0", "function": {"name": "read_file", "arguments": _j.dumps({"path": "a.txt"})}},
+        {"id": "c1", "function": {"name": "done", "arguments": _j.dumps({"summary": "ok"})}},
+        {"id": "c2", "function": {"name": "bash", "arguments": _j.dumps({"command": "echo hi"})}},
+    ]}
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: msg)
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=3)
+    assert result == "ok"
+    assert _tool_call_ids(messages) == _tool_result_ids(messages)
+
+
+def test_repeated_call_stop_still_answers_every_tool_use(tmp_path, monkeypatch):
+    calls = [_call("bash", {"command": "echo hi"})] * 5
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0) if calls else _call("done", {"summary": "x"}))
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=6)
+    assert "stopped: no_progress" in result
+    assert _tool_call_ids(messages) == _tool_result_ids(messages)
+
+
 def test_run_stops_when_idle(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: {"content": "thinking..."})
     assert "stopped: idle" in agent.run("t", tmp_path, max_steps=6)

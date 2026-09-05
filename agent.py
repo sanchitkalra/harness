@@ -165,7 +165,7 @@ def drive(
         idle_turns = 0
         renderer.begin_tools(step)
         try:
-            for c in calls:
+            for idx, c in enumerate(calls):
                 name = c["function"]["name"]
                 try:
                     args = json.loads(c["function"].get("arguments") or "{}")
@@ -177,6 +177,9 @@ def drive(
                 seen[key] = seen.get(key, 0) + 1
                 if seen[key] > 1:  # repeat: warn, and stop if it keeps going nowhere
                     if seen[key] >= MAX_REPEAT_CALLS:
+                        messages.append({"role": "tool", "tool_call_id": c["id"],
+                                         "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); stopping"})
+                        _close_dangling_calls(messages, calls[idx + 1:], "skipped: agent stopped before this call ran")
                         return _stop(log_path, step, f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)")
                     messages.append({"role": "tool", "tool_call_id": c["id"],
                                      "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
@@ -185,6 +188,10 @@ def drive(
                 if name == "done":
                     final = args.get("summary", "")
                     log(log_path, {"step": step, "tool": name, "args": args, "result": final})
+                    # Every tool_use in this turn needs a reply — Anthropic rejects a
+                    # history with any left dangling once this list is replayed next turn.
+                    messages.append({"role": "tool", "tool_call_id": c["id"], "content": final})
+                    _close_dangling_calls(messages, calls[idx + 1:], "skipped: agent finished via done before this call ran")
                     renderer.end_tools()
                     return final
                 try:
@@ -197,6 +204,19 @@ def drive(
         finally:
             renderer.end_tools()
     return _stop(log_path, max_steps, f"stopped: max_steps ({max_steps} steps without done)")
+
+
+def _close_dangling_calls(messages: list[dict], skipped_calls: list[dict], reason: str) -> None:
+    """Reply to tool_calls that were queued in this turn but never run.
+
+    Every tool_use in an assistant turn needs a matching tool_result before
+    the conversation continues — Anthropic rejects a history with any left
+    unanswered. OpenAI tolerates it, so this only ever bit once Anthropic
+    support existed, but it was a latent bug for interactive sessions
+    regardless of provider (messages persist across turns there).
+    """
+    for c in skipped_calls:
+        messages.append({"role": "tool", "tool_call_id": c["id"], "content": f"error: {reason}"})
 
 
 def _stop(log_path: Path | None, step: int, msg: str) -> str:
