@@ -13,12 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import ui
-from model import ApiError, NetworkError, llm_call, llm_config
+from model import ApiError, NetworkError, llm_call, llm_config, resolve_provider
 from tools import (  # re-exported: tests and callers keep working via agent.*
     MAX_OUTPUT_CHARS,
     TOOLS,
@@ -34,6 +35,9 @@ from tools import (  # re-exported: tests and callers keep working via agent.*
 )
 
 DEFAULT_MAX_STEPS = 30
+STEP_EXTENSION = 15  # granted when the budget runs out but the model is still making progress
+MAX_STEP_CEILING = 100  # hard ceiling on auto-extension, regardless of --max-steps, so a
+                        # genuinely stuck-but-not-idle loop can't run forever
 MAX_REPEAT_CALLS = 3  # same tool+args this many times -> stop: no_progress
 MAX_IDLE_TURNS = 3  # model replies with no tool call this many times in a row -> stop
 
@@ -54,8 +58,7 @@ def load_instructions(root: Path) -> str:
         p = root / name
         try:
             if p.is_file():
-                text = p.read_text(encoding="utf-8")
-                return text[:2000]
+                return p.read_text(encoding="utf-8")
         except Exception:
             continue
     return ""
@@ -65,8 +68,7 @@ def load_memory(root: Path) -> str:
     p = root / "MEMORY.md"
     try:
         if p.is_file():
-            text = p.read_text(encoding="utf-8")
-            return text[:2000]
+            return p.read_text(encoding="utf-8")
     except Exception:
         pass
     return ""
@@ -117,8 +119,7 @@ def drive(
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _base, _model, _key = llm_config()
-            model_name = _model
+            model_name = resolve_provider().model
         except Exception:
             model_name = "unknown"
         # Derive task for header from last user message, else empty
@@ -144,28 +145,47 @@ def drive(
 
     seen: dict[tuple, int] = {}  # (tool, canonical args) -> times seen; bounded by repeat limit
     idle_turns = 0
-    for step in range(1, max_steps + 1):
+    cap = max_steps
+    # An explicit --max-steps above the default ceiling is a deliberate ask —
+    # respected in full, not clamped down. Below it, auto-extension can grow
+    # the budget up to the ceiling but no further.
+    extension_ceiling = max(max_steps, MAX_STEP_CEILING)
+    step = 0
+    while True:
+        if step >= cap:
+            # Budget exhausted. Extend it instead of giving up if the model
+            # is still doing real work (last turn wasn't idle) — a fixed
+            # step count treats every step as equally valuable, but some
+            # tasks genuinely need more exploration than others.
+            if idle_turns == 0 and cap < extension_ceiling:
+                cap = min(cap + STEP_EXTENSION, extension_ceiling)
+                renderer.step(step, cap, f"[still making progress — extended budget to {cap} steps]")
+            else:
+                return _stop(log_path, step, f"stopped: max_steps ({step} steps without done)")
+        step += 1
         try:
             msg = llm_call(messages, TOOLS)
         except ApiError as e:
-            return _stop(log_path, step, f"stopped: api ({e}, {step}/{max_steps} steps)")
+            return _stop(log_path, step, f"stopped: api ({e}, {step}/{cap} steps)")
         except NetworkError as e:  # network down even after retries: stop, don't crash
-            return _stop(log_path, step, f"stopped: network ({e}, {step}/{max_steps} steps)")
+            return _stop(log_path, step, f"stopped: network ({e}, {step}/{cap} steps)")
+        except RuntimeError as e:  # no provider configured — e.g. opened the TUI before /model
+            return _stop(log_path, step, f"stopped: no_provider ({e}); configure one with /model or an API key env var")
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
         if text:
-            renderer.step(step, max_steps, text)
+            renderer.step(step, cap, text)
         if not calls:  # model talked without acting: nudge it back to tools
             idle_turns += 1
             if idle_turns >= MAX_IDLE_TURNS:
-                return _stop(log_path, step, f"stopped: idle (no tool call for {idle_turns} turns, {step}/{max_steps} steps)")
+                return _stop(log_path, step, f"stopped: idle (no tool call for {idle_turns} turns, {step}/{cap} steps)")
             messages.append({"role": "user", "content": "Continue: call a tool or done."})
             continue
         idle_turns = 0
         renderer.begin_tools(step)
         try:
-            for c in calls:
+            for idx, c in enumerate(calls):
                 name = c["function"]["name"]
                 try:
                     args = json.loads(c["function"].get("arguments") or "{}")
@@ -177,7 +197,10 @@ def drive(
                 seen[key] = seen.get(key, 0) + 1
                 if seen[key] > 1:  # repeat: warn, and stop if it keeps going nowhere
                     if seen[key] >= MAX_REPEAT_CALLS:
-                        return _stop(log_path, step, f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{max_steps} steps)")
+                        messages.append({"role": "tool", "tool_call_id": c["id"],
+                                         "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); stopping"})
+                        _close_dangling_calls(messages, calls[idx + 1:], "skipped: agent stopped before this call ran")
+                        return _stop(log_path, step, f"stopped: no_progress (repeated {name} {MAX_REPEAT_CALLS}x, {step}/{cap} steps)")
                     messages.append({"role": "tool", "tool_call_id": c["id"],
                                      "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
                     continue
@@ -185,6 +208,10 @@ def drive(
                 if name == "done":
                     final = args.get("summary", "")
                     log(log_path, {"step": step, "tool": name, "args": args, "result": final})
+                    # Every tool_use in this turn needs a reply — Anthropic rejects a
+                    # history with any left dangling once this list is replayed next turn.
+                    messages.append({"role": "tool", "tool_call_id": c["id"], "content": final})
+                    _close_dangling_calls(messages, calls[idx + 1:], "skipped: agent finished via done before this call ran")
                     renderer.end_tools()
                     return final
                 try:
@@ -196,7 +223,19 @@ def drive(
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
         finally:
             renderer.end_tools()
-    return _stop(log_path, max_steps, f"stopped: max_steps ({max_steps} steps without done)")
+
+
+def _close_dangling_calls(messages: list[dict], skipped_calls: list[dict], reason: str) -> None:
+    """Reply to tool_calls that were queued in this turn but never run.
+
+    Every tool_use in an assistant turn needs a matching tool_result before
+    the conversation continues — Anthropic rejects a history with any left
+    unanswered. OpenAI tolerates it, so this only ever bit once Anthropic
+    support existed, but it was a latent bug for interactive sessions
+    regardless of provider (messages persist across turns there).
+    """
+    for c in skipped_calls:
+        messages.append({"role": "tool", "tool_call_id": c["id"], "content": f"error: {reason}"})
 
 
 def _stop(log_path: Path | None, step: int, msg: str) -> str:
@@ -295,7 +334,7 @@ def main() -> None:
     ap.add_argument("--list", dest="list_flag", action="store_true", help="list sessions/*.jsonl (id, ts, task) and exit")
     ap.add_argument("--fork", dest="fork_id", default=None, help="fork from existing session id (root/sessions/<id>.jsonl)")
     ap.add_argument("-i", "--interactive", dest="interactive", action="store_true", help="interactive REPL mode")
-    ap.add_argument("--no-tui", dest="no_tui", action="store_true", help="disable curses TUI in interactive mode")
+    ap.add_argument("--no-tui", dest="no_tui", action="store_true", help="disable Textual TUI in interactive mode")
     args = ap.parse_args()
     root = Path(args.workspace).resolve()
     if args.list_flag:
@@ -328,51 +367,41 @@ def main() -> None:
             step_count = 0
         context_line = f"Forked from session {parent_id_for_header}: task={parent_task!r} steps={step_count}"
         task_text = context_line + "\n" + task_text
+    will_use_tui = False
+    if args.interactive and not args.no_tui:
+        try:
+            will_use_tui = sys.stdout.isatty()
+        except Exception:
+            will_use_tui = False
     try:
-        llm_config()
+        resolve_provider()
     except RuntimeError as e:
-        ap.error(f"{e} (or use --smoke for the no-API check)")
+        # The TUI has a /model command to configure a provider after opening,
+        # so let it start unconfigured; every other mode has no such escape
+        # hatch and should fail fast instead of crashing on the first call.
+        if not will_use_tui:
+            ap.error(f"{e} (or use --smoke for the no-API check)")
 
     if args.interactive:
-        # Decide renderer: TuiRenderer when TTY and not --no-tui, else PrintRenderer (keep print behavior)
-        use_tui = False
-        tui_renderer = None
-        if not args.no_tui:
-            try:
-                if sys.stdout.isatty():
-                    use_tui = True
-            except Exception:
-                use_tui = False
-
+        use_tui = will_use_tui
+        renderer = None
         if use_tui:
             try:
                 import tui as tui_mod  # local
-                # model name for status bar
                 try:
-                    _, model_name, _ = llm_config()
+                    model_name = resolve_provider().model
                 except Exception:
                     model_name = "unknown"
-                tui_renderer = tui_mod.TuiRenderer(model_name=model_name, session_id=parent_id_for_header or "")
-                tui_renderer.start_curses()
+                renderer = tui_mod.TuiRenderer(model_name=model_name, session_id=parent_id_for_header or "")
             except Exception:
-                # fallback to non-TUI if curses init fails
-                if tui_renderer is not None:
-                    try:
-                        tui_renderer.stop_curses()
-                    except Exception:
-                        pass
                 use_tui = False
-                tui_renderer = None
-
-        # default print renderer when no TUI
-        if tui_renderer is None:
-            default_renderer = ui.PrintRenderer()
-        else:
-            default_renderer = tui_renderer  # type: ignore
+                renderer = None
+        if renderer is None:
+            renderer = ui.PrintRenderer()
 
         def get_input_line(prompt: str = "> ") -> str | None:
-            if use_tui and tui_renderer is not None:
-                return tui_renderer.read_line(prompt)
+            if use_tui:
+                return renderer.read_line(prompt)
             try:
                 return input(prompt)
             except EOFError:
@@ -382,77 +411,86 @@ def main() -> None:
         def show_final(r: str | None) -> None:
             if r is None:
                 return
-            if use_tui and tui_renderer is not None:
-                tui_renderer.final(r)
-            else:
-                ui.final(r)
+            renderer.final(r)
 
-        def run_drive_with_renderer(msgs: list[dict], lpath: Path, pid: str | None, rend) -> str | None:
+        def run_drive_with_renderer(msgs: list[dict], lpath: Path, pid: str | None) -> str | None:
             try:
-                return drive(msgs, root, args.max_steps, lpath, parent_id=pid, renderer=rend)
+                return drive(msgs, root, args.max_steps, lpath, parent_id=pid, renderer=renderer)
             except KeyboardInterrupt:
-                if use_tui and tui_renderer is not None:
-                    tui_renderer.transcript.append("[cancelled]")
+                if use_tui:
+                    renderer.cancelled()
                 else:
                     print("\n[cancelled]")
                 return None
 
-        messages = new_conversation(task_text, root)
-        prev_id = parent_id_for_header
-        # If initial task_text exists, run it as first turn
-        if task_text:
-            log_path = _unique_log_path(root)
-            # keep session id in status bar
-            if use_tui and tui_renderer is not None:
-                tui_renderer.update_status(session_id=log_path.stem)
-            result = run_drive_with_renderer(messages, log_path, prev_id, default_renderer)
-            if result is not None:
+        def run_interactive_session() -> None:
+            messages = new_conversation(task_text, root)
+            prev_id = parent_id_for_header
+            if task_text:
+                log_path = _unique_log_path(root)
+                if use_tui:
+                    renderer.update_status(session_id=log_path.stem)
+                result = run_drive_with_renderer(messages, log_path, prev_id)
+                if result is not None:
+                    show_final(result)
+                    prev_id = log_path.stem
+                    if use_tui:
+                        renderer.update_status(session_id=prev_id)
+
+            while True:
+                try:
+                    line = get_input_line("> ")
+                except KeyboardInterrupt:
+                    if not use_tui:
+                        print()
+                    continue
+                if use_tui and renderer.take_clear_request():
+                    messages = new_conversation("", root)
+                    prev_id = None
+                if line is None:
+                    if not use_tui:
+                        print()
+                    break
+                if not line.strip():
+                    if use_tui:
+                        # Enter sends; empty input is a no-op, exit via Ctrl-D/Ctrl-C.
+                        continue
+                    break
+                checkpoint = len(messages)
+                messages.append({"role": "user", "content": line})
+                log_path = _unique_log_path(root)
+                if use_tui:
+                    renderer.update_status(session_id=log_path.stem)
+                result = run_drive_with_renderer(messages, log_path, prev_id)
+                if result is None:
+                    # cancelled via KeyboardInterrupt inside drive — pop message
+                    del messages[checkpoint:]
+                    continue
                 show_final(result)
                 prev_id = log_path.stem
-                if use_tui and tui_renderer is not None:
-                    tui_renderer.update_status(session_id=prev_id)
+                if use_tui:
+                    renderer.update_status(session_id=prev_id)
 
-        while True:
-            try:
-                line = get_input_line("> ")
-            except KeyboardInterrupt:
-                if not use_tui:
-                    print()
-                continue
-            if line is None:
-                if not use_tui:
-                    print()
-                break
-            if not line.strip():
-                if not use_tui:
-                    # original behavior: empty breaks outer loop
-                    break
-                else:
-                    # in TUI empty input should not exit? keep same as original? spec says Enter sends.
-                    # We'll treat empty as no-op in TUI and continue
-                    # But if user wants to exit empty, they can Ctrl-D.
-                    # For parity with original spec: empty should NOT break in TUI? Let's treat empty as skip.
-                    continue
-            checkpoint = len(messages)
-            messages.append({"role": "user", "content": line})
-            log_path = _unique_log_path(root)
-            if use_tui and tui_renderer is not None:
-                tui_renderer.update_status(session_id=log_path.stem)
-            result = run_drive_with_renderer(messages, log_path, prev_id, default_renderer)
-            if result is None:
-                # cancelled via KeyboardInterrupt inside drive — pop message
-                del messages[checkpoint:]
-                continue
-            show_final(result)
-            prev_id = log_path.stem
-            if use_tui and tui_renderer is not None:
-                tui_renderer.update_status(session_id=prev_id)
+        if use_tui:
+            def worker() -> None:
+                # Wait for the app's event loop to actually be running —
+                # call_from_thread (used by every Renderer method) raises
+                # if invoked any earlier.
+                renderer.wait_until_ready(timeout=10)
+                try:
+                    run_interactive_session()
+                finally:
+                    try:
+                        renderer.call_from_thread(renderer.exit)
+                    except Exception:
+                        pass  # app may already be exiting (e.g. Ctrl-C from the UI thread)
 
-        if use_tui and tui_renderer is not None:
-            try:
-                tui_renderer.stop_curses()
-            except Exception:
-                pass
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            renderer.run()  # blocks main thread until renderer.exit()
+            t.join(timeout=2)
+        else:
+            run_interactive_session()
         return
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")

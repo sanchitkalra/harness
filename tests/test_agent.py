@@ -1,6 +1,7 @@
 """Unit tests for the harness itself (no API key needed)."""
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -97,6 +98,87 @@ def test_run_stops_on_repeated_calls(tmp_path, monkeypatch):
     assert "stopped: no_progress" in agent.run("t", tmp_path, max_steps=6)
 
 
+def _unique_bash_call(n):
+    return _call("bash", {"command": f"echo {n}"}, cid=f"c{n}")
+
+
+def test_default_budget_auto_extends_in_15s_up_to_the_100_ceiling(tmp_path, monkeypatch):
+    """A model that keeps making distinct tool calls (never idle, never
+    repeating) should run past the 30-step default in +15 increments,
+    capped at MAX_STEP_CEILING — not die at step 30."""
+    counter = {"n": 0}
+
+    def busy(*a, **k):
+        counter["n"] += 1
+        return _unique_bash_call(counter["n"])
+
+    monkeypatch.setattr(agent, "llm_call", busy)
+    out = agent.run("t", tmp_path, max_steps=agent.DEFAULT_MAX_STEPS)
+    assert agent.DEFAULT_MAX_STEPS == 30
+    assert agent.MAX_STEP_CEILING == 100
+    assert out == f"stopped: max_steps ({agent.MAX_STEP_CEILING} steps without done)"
+    assert counter["n"] == agent.MAX_STEP_CEILING
+
+
+def test_idle_model_stops_at_default_budget_without_extension(tmp_path, monkeypatch):
+    """Extension only fires when the model is doing real work — an idle
+    model must still stop via MAX_IDLE_TURNS, far short of the ceiling."""
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: {"content": "thinking...", "tool_calls": []})
+    out = agent.run("t", tmp_path, max_steps=agent.DEFAULT_MAX_STEPS)
+    assert out.startswith("stopped: idle")
+    assert f"/{agent.DEFAULT_MAX_STEPS} steps" in out
+
+
+def test_explicit_max_steps_above_ceiling_is_respected_not_clamped(tmp_path, monkeypatch):
+    """An explicit --max-steps above the default ceiling is a deliberate
+    ask and must run in full, not get silently clamped down to 100."""
+    counter = {"n": 0}
+
+    def busy(*a, **k):
+        counter["n"] += 1
+        return _unique_bash_call(counter["n"])
+
+    monkeypatch.setattr(agent, "llm_call", busy)
+    out = agent.run("t", tmp_path, max_steps=150)
+    assert out == "stopped: max_steps (150 steps without done)"
+    assert counter["n"] == 150
+
+
+def _tool_call_ids(messages):
+    return {c["id"] for m in messages for c in (m.get("tool_calls") or [])}
+
+
+def _tool_result_ids(messages):
+    return {m["tool_call_id"] for m in messages if m.get("role") == "tool"}
+
+
+def test_done_alongside_other_calls_still_answers_every_tool_use(tmp_path, monkeypatch):
+    """Every tool_use in a turn must get a matching tool_result — even calls
+    skipped because `done` cut the batch short — or a strict provider
+    (Anthropic) rejects the history on the very next turn."""
+    import json as _j
+
+    msg = {"content": "", "tool_calls": [
+        {"id": "c0", "function": {"name": "read_file", "arguments": _j.dumps({"path": "a.txt"})}},
+        {"id": "c1", "function": {"name": "done", "arguments": _j.dumps({"summary": "ok"})}},
+        {"id": "c2", "function": {"name": "bash", "arguments": _j.dumps({"command": "echo hi"})}},
+    ]}
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: msg)
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=3)
+    assert result == "ok"
+    assert _tool_call_ids(messages) == _tool_result_ids(messages)
+
+
+def test_repeated_call_stop_still_answers_every_tool_use(tmp_path, monkeypatch):
+    calls = [_call("bash", {"command": "echo hi"})] * 5
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0) if calls else _call("done", {"summary": "x"}))
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=6)
+    assert "stopped: no_progress" in result
+    assert _tool_call_ids(messages) == _tool_result_ids(messages)
+
+
 def test_run_stops_when_idle(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: {"content": "thinking..."})
     assert "stopped: idle" in agent.run("t", tmp_path, max_steps=6)
@@ -151,10 +233,10 @@ def test_session_header_roundtrip(tmp_path, monkeypatch):
     # check model value when env gives default muse model
     assert header["model"] == "muse-spark-1.1"
 
-    # now test fallback to unknown when llm_config fails
+    # now test fallback to unknown when provider resolution fails
     def fail_config():
         raise RuntimeError("no key")
-    monkeypatch.setattr(agent, "llm_config", fail_config)
+    monkeypatch.setattr(agent, "resolve_provider", fail_config)
     log_path2 = tmp_path / "sessions" / "20240101-000001.jsonl"
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "ok2"}))
     agent.run("another task", tmp_path, max_steps=3, log_path=log_path2)
@@ -163,7 +245,7 @@ def test_session_header_roundtrip(tmp_path, monkeypatch):
     assert header2["workspace"] == str(tmp_path)
 
 
-def test_load_instructions_precedence_and_truncation(tmp_path):
+def test_load_instructions_precedence_and_no_truncation(tmp_path):
     # empty -> ""
     assert agent.load_instructions(tmp_path) == ""
     # CLAUDE.md fallback
@@ -172,9 +254,9 @@ def test_load_instructions_precedence_and_truncation(tmp_path):
     # AGENTS.md wins over CLAUDE.md
     (tmp_path / "AGENTS.md").write_text("from agents")
     assert agent.load_instructions(tmp_path) == "from agents"
-    # truncates to 2000 chars
+    # no cap: a large file comes back whole
     (tmp_path / "AGENTS.md").write_text("x" * 5000)
-    assert len(agent.load_instructions(tmp_path)) == 2000
+    assert len(agent.load_instructions(tmp_path)) == 5000
 
 
 def test_run_injects_instructions(tmp_path, monkeypatch):
@@ -235,7 +317,7 @@ def test_main_fork_cli(tmp_path, monkeypatch, capsys):
         '{"step":1}\n{"step":2}\n'
     )
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "forked ok"}))
-    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
     monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "--fork", parent_id, "continue work"])
     agent.main()
     # find child session (different from parent)
@@ -416,6 +498,18 @@ def test_run_returns_stopped_on_network_failure(tmp_path, monkeypatch):
     assert out.startswith("stopped: network")
 
 
+def test_run_returns_stopped_when_no_provider_configured(tmp_path, monkeypatch):
+    """Opening the TUI unconfigured (see /model) must not crash on first
+    submit — drive() turns the RuntimeError into a friendly stop message."""
+    def boom(*a, **k):
+        raise RuntimeError("set MODEL_API_KEY (Muse Spark), OPENAI_API_KEY, or ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(agent, "llm_call", boom)
+    out = agent.run("t", tmp_path, max_steps=3)
+    assert out.startswith("stopped: no_provider")
+    assert "/model" in out
+
+
 def test_web_search_retries_then_succeeds(tmp_path, monkeypatch):
     import urllib.request as _urllib_req
 
@@ -511,7 +605,7 @@ def test_drive_two_turns_shared_history(tmp_path, monkeypatch):
 
 def test_interactive_bare_eof_exits_without_drive(tmp_path, monkeypatch):
     """bare -i: input EOF immediately → exits without calling drive."""
-    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
     calls = []
 
     def fake_drive(*a, **k):
@@ -527,7 +621,7 @@ def test_interactive_bare_eof_exits_without_drive(tmp_path, monkeypatch):
 
 def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
     """-i with a task: runs drive once for initial task, then EOF exits."""
-    monkeypatch.setattr(agent, "llm_config", lambda: ("https://api.meta.ai/v1", "muse-spark-1.1", "k"))
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
     calls = []
 
     def fake_drive(*a, **k):
@@ -539,6 +633,56 @@ def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i", "do thing"])
     agent.main()
     assert len(calls) == 1
+
+
+def test_interactive_tui_opens_even_when_unconfigured(tmp_path, monkeypatch):
+    """The TUI has /model to configure a provider after opening, so -i on a
+    tty should NOT hard-exit before even starting — unlike every other mode
+    (--no-tui, non-interactive), which has no such escape hatch."""
+    import threading
+    import types
+
+    def always_unconfigured():
+        raise RuntimeError("no key")
+
+    monkeypatch.setattr(agent, "resolve_provider", always_unconfigured)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    class FakeRenderer:
+        def __init__(self, model_name="unknown", session_id=""):
+            self.model_name = model_name
+            self._exit_event = threading.Event()
+
+        def wait_until_ready(self, timeout=None):
+            pass
+
+        def call_from_thread(self, fn, *a, **k):
+            return fn(*a, **k)
+
+        def read_line(self, prompt="> "):
+            return None  # simulate immediate EOF
+
+        def take_clear_request(self):
+            return False
+
+        def update_status(self, **kw):
+            pass
+
+        def final(self, s):
+            pass
+
+        def cancelled(self):
+            pass
+
+        def exit(self):
+            self._exit_event.set()
+
+        def run(self):
+            self._exit_event.wait(timeout=2)
+
+    monkeypatch.setitem(sys.modules, "tui", types.SimpleNamespace(TuiRenderer=FakeRenderer))
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "-i"])
+    agent.main()  # must not raise SystemExit via ap.error
 
 
 def test_load_memory_missing(tmp_path):
@@ -553,15 +697,13 @@ def test_load_memory_in_system_prompt(tmp_path):
     assert "durable fact: cats" in sys_msg
 
 
-def test_load_memory_truncation(tmp_path):
+def test_load_memory_not_truncated(tmp_path):
     long_text = "x" * 5000
     (tmp_path / "MEMORY.md").write_text(long_text, encoding="utf-8")
     mem = agent.load_memory(tmp_path)
-    assert len(mem) == 2000
-    assert mem == long_text[:2000]
+    assert mem == long_text
     msgs = agent.new_conversation("hi", tmp_path)
-    assert long_text[:2000] in msgs[0]["content"]
-    assert long_text[2000:] not in msgs[0]["content"]
+    assert long_text in msgs[0]["content"]
 
 
 def test_llm_call_surfaces_status_code(monkeypatch):
