@@ -1,8 +1,9 @@
-# Mini coding-agent harness
+# Rig
 
-Four small modules with strict boundaries: `agent.py` orchestrates (loop,
-sessions, CLI), `model.py` talks to the LLM, `tools.py` touches the
-workspace, `ui.py` renders the terminal. Each is readable end to end.
+A minimal coding-agent harness. Four small modules with strict boundaries:
+`agent.py` orchestrates (loop, sessions, CLI), `model.py` talks to the LLM,
+`tools.py` touches the workspace, `ui.py` renders the terminal. Each is
+readable end to end.
 
 ## Setup (project-local env)
 
@@ -18,9 +19,10 @@ source .venv/bin/activate
 uv tool install --editable .
 ```
 
-Puts `harness` on your PATH (no venv activation needed) so `harness -i` works
-from any directory — `--workspace` defaults to `.`, so it targets whichever
-project you're standing in.
+Puts `rig` on your PATH (no venv activation needed) so `rig` works from any
+directory — interactive mode is on by default (no more typing `-i` every
+time), and `--workspace` defaults to `.`, so it targets whichever project
+you're standing in.
 
 ## Try it without an API key
 
@@ -40,7 +42,7 @@ python -m agent "create hello.txt with one line, then verify with ls" --workspac
 cat sessions/*.jsonl  # replay log
 ```
 
-Check the key alone first (no harness involved):
+Check the key alone first (no rig involved):
 
 ```
 curl -s https://api.meta.ai/v1/models -H "Authorization: Bearer $MODEL_API_KEY" | head -c 500
@@ -62,15 +64,15 @@ In the TUI, type `/login` to open a picker of saved logins (name, provider —
 anthropic/openai/compatible —, API key, base URL) or add a new one. `/model`
 then picks or adds a model within the active login, so switching models
 doesn't require re-entering credentials. Both are remembered in
-`~/.config/harness/models.json` (mode 600) for every future run — no env
-vars needed. Env vars still override it when set. Opening `harness -i` with
+`~/.config/rig/models.json` (mode 600) for every future run — no env
+vars needed. Env vars still override it when set. Opening `rig` with
 nothing configured at all now works (it used to hard-exit) — it starts with
 a tip to run `/login`.
 
 ## What's inside (learning map)
 
 - `model.py` — `resolve_provider()` picks a `Provider` strategy (`OpenAIProvider` / `AnthropicProvider`) from env vars, then the saved registry; `llm_call()` calls it. Knows nothing about tools or files. Add a provider by writing a class with `model` + `call(messages, tools)` and wiring it into `resolve_provider()`.
-- `model_registry.py` — persisted logins (`provider`, `api_key`, `base_url`, and the models saved under them) at `~/.config/harness/models.json`; logins managed via `/login`, models within the active login via `/model` in the TUI.
+- `model_registry.py` — persisted logins (`provider`, `api_key`, `base_url`, and the models saved under them) at `~/.config/rig/models.json`; logins managed via `/login`, models within the active login via `/model` in the TUI.
 - `tools.py` — `TOOLS`, `resolve()` sandbox, `tool_read / tool_edit / tool_write / tool_bash`, `dispatch()`
 - `ui.py` — terminal rendering (ANSI on tty only); takes plain data, never imports the other modules
 - `agent.py` — `run()` loop, session headers + `--list` / `--fork`, `load_instructions()`, `smoke_test()`, CLI

@@ -1,11 +1,11 @@
 [project]
-name = "mini-harness"
+name = "rig"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["textual>=0.60"]
 
 [project.scripts]
-harness = "agent:main"
+rig = "agent:main"
 
 [tool.setuptools]
 py-modules = ["agent", "model", "model_registry", "tools", "ui", "tui"]

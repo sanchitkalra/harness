@@ -11,7 +11,7 @@ import model_registry as mr
 
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
-    monkeypatch.setenv("HARNESS_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("RIG_CONFIG_DIR", str(tmp_path))
 
 
 def test_empty_registry_by_default():

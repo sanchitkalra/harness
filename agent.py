@@ -329,15 +329,16 @@ def _unique_log_path(root: Path) -> Path:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Mini coding-agent harness")
-    ap.add_argument("--version", action="version", version="harness 0.1.0")
+    ap = argparse.ArgumentParser(description="Rig: a minimal coding-agent harness")
+    ap.add_argument("--version", action="version", version="rig 0.1.0")
     ap.add_argument("task", nargs="?", default="", help="task text")
     ap.add_argument("--workspace", default=".", help="workspace root")
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--smoke", action="store_true", help="run no-API smoke test")
     ap.add_argument("--list", dest="list_flag", action="store_true", help="list sessions/*.jsonl (id, ts, task) and exit")
     ap.add_argument("--fork", dest="fork_id", default=None, help="fork from existing session id (root/sessions/<id>.jsonl)")
-    ap.add_argument("-i", "--interactive", dest="interactive", action="store_true", help="interactive REPL mode")
+    ap.add_argument("-i", "--interactive", dest="interactive", action="store_true", default=True, help="interactive REPL mode (default: on)")
+    ap.add_argument("--no-interactive", dest="interactive", action="store_false", help="run the task once and exit instead of dropping into a REPL")
     ap.add_argument("--no-tui", dest="no_tui", action="store_true", help="disable Textual TUI in interactive mode")
     args = ap.parse_args()
     root = Path(args.workspace).resolve()

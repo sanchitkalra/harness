@@ -35,7 +35,7 @@ def clear_keys(monkeypatch):
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
     """Never let a real ~/.config/harness/models.json leak into these tests."""
-    monkeypatch.setenv("HARNESS_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("RIG_CONFIG_DIR", str(tmp_path))
 
 
 def test_resolve_provider_prefers_openai(monkeypatch):

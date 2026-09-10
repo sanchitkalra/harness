@@ -3,7 +3,7 @@ holding one or more model names.
 
 Lets you save credentials once instead of exporting env vars every run,
 and flip between models on the same credentials without re-entering a key.
-Storage: ~/.config/harness/models.json, mode 600 (it holds API keys).
+Storage: ~/.config/rig/models.json, mode 600 (it holds API keys).
 Env vars still take precedence in model.resolve_provider() — this is
 only consulted when none are set.
 
@@ -20,7 +20,12 @@ PROVIDERS = ("anthropic", "openai", "compatible")
 
 
 def registry_path() -> Path:
-    return Path(os.environ.get("HARNESS_CONFIG_DIR", Path.home() / ".config" / "harness")) / "models.json"
+    return Path(os.environ.get("RIG_CONFIG_DIR", Path.home() / ".config" / "rig")) / "models.json"
+
+
+# ponytail: one-time read fallback for anyone upgrading from the old
+# "harness" name — the next save_registry() call migrates them for good.
+_LEGACY_PATH = Path.home() / ".config" / "harness" / "models.json"
 
 
 def _migrate_legacy(data: dict) -> dict:
@@ -41,6 +46,8 @@ def _migrate_legacy(data: dict) -> dict:
 
 def load_registry() -> dict:
     p = registry_path()
+    if not p.is_file() and "RIG_CONFIG_DIR" not in os.environ and _LEGACY_PATH.is_file():
+        p = _LEGACY_PATH
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:

@@ -318,7 +318,7 @@ def test_main_fork_cli(tmp_path, monkeypatch, capsys):
     )
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: _call("done", {"summary": "forked ok"}))
     monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
-    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "--fork", parent_id, "continue work"])
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "--no-interactive", "--fork", parent_id, "continue work"])
     agent.main()
     # find child session (different from parent)
     files = [p for p in sdir.glob("*.jsonl") if p.stem != parent_id]
@@ -635,6 +635,35 @@ def test_interactive_with_task_runs_once_then_eof(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_interactive_is_the_default_without_any_flag(tmp_path, monkeypatch):
+    """No -i needed anymore: a bare task drops into the REPL by default."""
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
+    calls = []
+
+    def fake_drive(*a, **k):
+        calls.append(1)
+        return "ok"
+
+    monkeypatch.setattr(agent, "drive", fake_drive)
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "do thing"])
+    agent.main()
+    assert len(calls) == 1
+
+
+def test_no_interactive_flag_still_runs_once_and_exits(tmp_path, monkeypatch):
+    """--no-interactive opts back out into the old one-shot, no-REPL mode."""
+    monkeypatch.setattr(agent, "resolve_provider", lambda: SimpleNamespace(model="muse-spark-1.1"))
+    monkeypatch.setattr(agent, "run", lambda *a, **k: "done")
+
+    def boom_input(prompt=""):
+        raise AssertionError("--no-interactive must not read from stdin")
+
+    monkeypatch.setattr("builtins.input", boom_input)
+    monkeypatch.setattr("sys.argv", ["agent", "--workspace", str(tmp_path), "--no-interactive", "do thing"])
+    agent.main()
+
+
 def test_interactive_tui_opens_even_when_unconfigured(tmp_path, monkeypatch):
     """The TUI has /model to configure a provider after opening, so -i on a
     tty should NOT hard-exit before even starting — unlike every other mode
@@ -748,7 +777,7 @@ def test_version_flag(capsys, monkeypatch):
         agent.main()
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    assert "harness 0.1.0" in out
+    assert "rig 0.1.0" in out
 
 
 def test_stopped_outcomes_logged(tmp_path, monkeypatch):

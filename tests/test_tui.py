@@ -16,8 +16,8 @@ from tui import TuiRenderer, _arg_hint, format_file_diff, format_footer, format_
 
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
-    """Never let a real ~/.config/harness/models.json leak into these tests."""
-    monkeypatch.setenv("HARNESS_CONFIG_DIR", str(tmp_path))
+    """Never let a real ~/.config/rig/models.json leak into these tests."""
+    monkeypatch.setenv("RIG_CONFIG_DIR", str(tmp_path))
 
 
 def test_format_status():
