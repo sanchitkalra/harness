@@ -66,6 +66,14 @@ class Renderer(Protocol):
 class PrintRenderer:
     """Default renderer that prints to stdout with color handling, preserving original behavior."""
 
+    approval_mode = "yolo"  # no TUI to switch this from; override on the instance if needed
+
+    def confirm_bash(self, command: str) -> bool:
+        try:
+            return input(f"Approve command? {command}\n[y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            return False
+
     def begin_tools(self, step_num: int) -> None:
         global _batch, _batch_step, _batch_lines
         _batch = []

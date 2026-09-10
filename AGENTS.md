@@ -24,3 +24,4 @@
 - `AGENTS.md`/`MEMORY.md` are injected into the system prompt uncapped (no length limit) — a large `MEMORY.md` grows every call's cost/context, there's no warning for that.
 - Model registry file location honors `RIG_CONFIG_DIR` env var (tests always set this to a tmp dir — never let a real `~/.config/rig/models.json` leak into a test).
 - `-i`/`--interactive` is on by default now; `--no-interactive` opts back into the old one-shot run-once-and-exit mode.
+- Bash approval: `TuiRenderer.approval_mode` (`plan`/`auto`/`yolo`, cycled with shift+tab or set via `/mode`) plus the model's per-call `risk` arg on the `bash` tool decide whether `agent._bash_needs_confirmation()` blocks on `renderer.confirm_bash()` before `dispatch()` runs. A renderer with no `approval_mode` attribute (one-shot `PrintRenderer`) behaves as `yolo` — no gating outside the TUI.

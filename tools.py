@@ -43,8 +43,18 @@ TOOLS = [
     },
     {
         "name": "bash",
-        "description": "Run a shell command with cwd=workspace. Returns exit code, stdout, stderr.",
-        "parameters": {"command": "e.g. pytest -q", "timeout_s": "optional seconds (default 30)"},
+        "description": (
+            "Run a shell command with cwd=workspace. Returns exit code, stdout, stderr. "
+            "In auto approval mode, the harness asks the user to confirm any call with "
+            "risk='confirm' before running it; set it for anything destructive or hard to "
+            "undo (rm, force-push, migrations, installs/upgrades, network writes) and "
+            "leave it 'safe' (the default) for routine reads/builds/tests."
+        ),
+        "parameters": {
+            "command": "e.g. pytest -q",
+            "timeout_s": "optional seconds (default 30)",
+            "risk": "optional 'safe' (default) or 'confirm' if this command should be approved by a human first",
+        },
     },
     {
         "name": "web_search",

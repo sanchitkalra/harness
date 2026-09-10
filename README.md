@@ -69,6 +69,23 @@ vars needed. Env vars still override it when set. Opening `rig` with
 nothing configured at all now works (it used to hard-exit) — it starts with
 a tip to run `/login`.
 
+## Bash approval modes
+
+The TUI gates `bash` calls behind one of three modes, shown in the footer
+and cycled with **shift+tab** (or set explicitly with `/mode plan|auto|yolo`):
+
+- **plan** — every bash command pauses for your approval first.
+- **auto** (default) — the model flags a call `risk="confirm"` when it's
+  destructive or hard to undo (rm, force-push, migrations, installs,
+  network writes); only those pause for approval, routine commands run
+  immediately.
+- **yolo** — nothing is ever confirmed.
+
+A denied command is reported back to the model as an error so it can try a
+different approach instead of getting stuck. This only applies to the TUI —
+plain/one-shot runs (`--no-tui`, `--no-interactive`) always behave like yolo
+since there's no one there to ask.
+
 ## What's inside (learning map)
 
 - `model.py` — `resolve_provider()` picks a `Provider` strategy (`OpenAIProvider` / `AnthropicProvider`) from env vars, then the saved registry; `llm_call()` calls it. Knows nothing about tools or files. Add a provider by writing a class with `model` + `call(messages, tools)` and wiring it into `resolve_provider()`.

@@ -42,6 +42,19 @@ MAX_REPEAT_CALLS = 3  # same tool+args this many times -> stop: no_progress
 MAX_IDLE_TURNS = 3  # model replies with no tool call this many times in a row -> stop
 
 
+def _bash_needs_confirmation(renderer: object, args: dict) -> bool:
+    """Whether a bash call should pause for human approval, per the
+    renderer's approval_mode: "plan" always asks, "yolo" never does, "auto"
+    asks only when the model flagged the call itself (args["risk"]=="confirm").
+    A renderer with no approval_mode (e.g. one-shot/plain runs) behaves as "yolo"."""
+    mode = getattr(renderer, "approval_mode", "yolo")
+    if mode == "plan":
+        return True
+    if mode == "auto":
+        return str(args.get("risk", "safe")).lower() == "confirm"
+    return False
+
+
 SYSTEM = (
     "You are a minimal coding agent. Work inside the workspace only. "
     "Use tools to read before editing, then verify with bash (e.g. pytest -q). "
@@ -209,6 +222,15 @@ def drive(
                                      "content": f"error: repeated_call: identical call to {name} ({seen[key]}x); try something different"})
                     continue
                 renderer.tool_call(step, name, json.dumps(args))
+                if name == "bash" and _bash_needs_confirmation(renderer, args):
+                    confirm_bash = getattr(renderer, "confirm_bash", None)
+                    approved = confirm_bash(args.get("command", "")) if confirm_bash else True
+                    if not approved:
+                        result = "error: denied_by_user: the user did not authorize this command"
+                        renderer.tool_result(name, result)
+                        log(log_path, {"step": step, "tool": name, "args": args, "result": result})
+                        messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+                        continue
                 if name == "done":
                     final = args.get("summary", "")
                     log(log_path, {"step": step, "tool": name, "args": args, "result": final})

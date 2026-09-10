@@ -44,12 +44,14 @@ def format_status(step_count: int, step_total: int | None = None) -> str:
     return f"step {steps}"
 
 
-def format_footer(session_name: str, session_id: str, group_name: str, model_name: str) -> tuple[str, str]:
-    """(session line, group/model line) shown under the input box."""
+def format_footer(session_name: str, session_id: str, group_name: str, model_name: str, mode: str = "") -> tuple[str, str]:
+    """(session line, group/model/mode line) shown under the input box."""
     session_line = (session_name or "").strip() or (session_id or "").strip() or "(unnamed session)"
     group = (group_name or "").strip()
     model = str(model_name or "unknown").strip() or "unknown"
     model_line = f"{group}/{model}" if group else model
+    if mode:
+        model_line += f" · mode: {mode}"
     return session_line, model_line
 
 
@@ -157,9 +159,22 @@ SLASH_COMMANDS: dict[str, str] = {
     "clear": "clear the transcript and start a new conversation",
     "login": "pick or add a login (provider + API key)",
     "model": "pick or add a model within the current login",
+    "mode": "set bash approval mode: plan | auto | yolo (or shift+tab to cycle)",
     "quit": "exit the app",
     "exit": "alias for /quit",
 }
+
+# plan: every bash call is confirmed. auto: only calls the model flags
+# risk="confirm" on. yolo: nothing is ever confirmed. Cycled with shift+tab.
+APPROVAL_MODES = ("plan", "auto", "yolo")
+
+
+def next_approval_mode(current: str) -> str:
+    try:
+        idx = APPROVAL_MODES.index(current)
+    except ValueError:
+        idx = -1
+    return APPROVAL_MODES[(idx + 1) % len(APPROVAL_MODES)]
 
 
 def format_file_diff(diff_lines: list[str], path_hint: str = "") -> tuple[str, str, list[tuple[str, str]]]:
@@ -370,6 +385,42 @@ class ModelPickerScreen(ModalScreen[str | None]):
 
 
 # ----------------------------------------------------------------------
+# ConfirmScreen — blocking bash-command approval prompt (plan mode, or
+# auto mode when the model flags a call risk="confirm").
+# ----------------------------------------------------------------------
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Dismisses with True (approved) or False (denied)."""
+
+    CSS = _PICKER_CSS
+    BINDINGS = [
+        Binding("y", "approve", "Approve"),
+        Binding("n", "deny", "Deny"),
+        Binding("escape", "deny", "Deny"),
+    ]
+
+    def __init__(self, command: str) -> None:
+        super().__init__()
+        self._command = command
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-box"):
+            yield Static("Run this command? (y to approve, n/esc to deny)")
+            yield Static(self._command, classes="dim")
+            yield Button("Approve", id="c-approve", variant="primary")
+            yield Button("Deny", id="c-deny")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "c-approve")
+
+    def action_approve(self) -> None:
+        self.dismiss(True)
+
+    def action_deny(self) -> None:
+        self.dismiss(False)
+
+
+# ----------------------------------------------------------------------
 # PromptInput — multi-line prompt box. Enter submits, shift+enter inserts
 # a newline; TextArea gives soft-wrap and multi-line height for free.
 # ----------------------------------------------------------------------
@@ -434,7 +485,13 @@ class TuiRenderer(App):
     # a turn is running on the worker thread — Python can't deliver a signal
     # into another thread. Upgrade path: cooperative cancellation flag checked
     # between tool calls in agent.drive(), if killing a running turn matters.
-    BINDINGS = [("ctrl+c", "quit_app", "Quit"), ("ctrl+d", "quit_app", "Quit")]
+    BINDINGS = [
+        ("ctrl+c", "quit_app", "Quit"),
+        ("ctrl+d", "quit_app", "Quit"),
+        # priority=True: Screen's default shift+tab->focus_previous binding
+        # would otherwise win since it's closer than the App in the DOM chain.
+        Binding("shift+tab", "cycle_mode", "Cycle approval mode", priority=True),
+    ]
 
     def __init__(self, model_name: str = "unknown", session_id: str = ""):
         super().__init__()
@@ -443,6 +500,7 @@ class TuiRenderer(App):
         self.session_name = ""
         active_group = model_registry.get_active_group()
         self.group_name = active_group["name"] if active_group else ""
+        self.approval_mode = "auto"
         self.step_count = 0
         self.step_total = 0
         self._input_queue: "queue.Queue[str | None]" = queue.Queue()
@@ -499,7 +557,8 @@ class TuiRenderer(App):
         self._footer_model = self.query_one("#footer-model", Static)
         self._refresh_status()
         self._mount_line(
-            "Tip: type / to see available commands (e.g. /help). Enter to send, shift+enter for a new line.",
+            "Tip: type / to see available commands (e.g. /help). Enter to send, shift+enter for a "
+            "new line, shift+tab to cycle the bash approval mode (plan/auto/yolo).",
             "dim",
         )
         self._input.focus()
@@ -524,12 +583,28 @@ class TuiRenderer(App):
         self._input_queue.put(None)
         self.exit()
 
+    def action_cycle_mode(self) -> None:
+        self.approval_mode = next_approval_mode(self.approval_mode)
+        self._refresh_status()
+        self._mount_line(f"approval mode: {self.approval_mode}", "dim")
+
+    def confirm_bash(self, command: str) -> bool:
+        """Renderer hook used by agent.drive() from the worker thread; blocks
+        until the user answers the modal pushed on the UI thread."""
+        result_queue: "queue.Queue[bool]" = queue.Queue()
+
+        def push() -> None:
+            self.push_screen(ConfirmScreen(command), lambda approved: result_queue.put(bool(approved)))
+
+        self.call_from_thread(push)
+        return result_queue.get()
+
     def _refresh_status(self) -> None:
         if self._status is not None:
             self._status.update(Text(format_status(self.step_count, self.step_total)))
         if self._footer_session is not None and self._footer_model is not None:
             session_line, model_line = format_footer(
-                self.session_name, self.session_id, self.group_name, self.model_name
+                self.session_name, self.session_id, self.group_name, self.model_name, self.approval_mode
             )
             self._footer_session.update(Text(session_line))
             self._footer_model.update(Text(model_line))
@@ -765,6 +840,14 @@ class TuiRenderer(App):
             self.push_screen(LoginPickerScreen(), self._on_login_picked)
         elif cmd == "model":
             self.push_screen(ModelPickerScreen(), self._on_model_picked)
+        elif cmd == "mode":
+            target = rest.lower()
+            if target not in APPROVAL_MODES:
+                self._mount_line(f"usage: /mode <{'|'.join(APPROVAL_MODES)}>", "err")
+            else:
+                self.approval_mode = target
+                self._refresh_status()
+                self._mount_line(f"approval mode set to {target!r}", "dim")
         elif cmd == "help":
             self._mount_line(
                 "\n".join(f"/{n} — {d}" for n, d in SLASH_COMMANDS.items()), "dim"

@@ -11,7 +11,16 @@ from textual.widgets import Collapsible, Input, Select, Static
 
 import model_registry as mr
 import tui
-from tui import TuiRenderer, _arg_hint, format_file_diff, format_footer, format_status, run_title, summarize_batch
+from tui import (
+    TuiRenderer,
+    _arg_hint,
+    format_file_diff,
+    format_footer,
+    format_status,
+    next_approval_mode,
+    run_title,
+    summarize_batch,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +42,9 @@ def test_format_footer():
     session2, model2 = format_footer("", "sess1", "", "")
     assert session2 == "sess1"
     assert model2 == "unknown"
+
+    _, model3 = format_footer("s", "sess1", "work", "claude-sonnet-5", "auto")
+    assert model3 == "work/claude-sonnet-5 · mode: auto"
 
 
 def test_arg_hint():
@@ -353,7 +365,7 @@ def test_footer_shows_session_name_and_group_model():
             app._refresh_status()
             await pilot.pause()
             assert app._footer_session.content.plain == "sess1"
-            assert app._footer_model.content.plain == "work/claude-sonnet-5"
+            assert app._footer_model.content.plain == "work/claude-sonnet-5 · mode: auto"
 
             app._handle_slash_command("/name my session")
             await pilot.pause()
@@ -685,5 +697,90 @@ def test_slash_model_picks_existing_model_within_active_login():
 
             assert mr.get_active_group()["active_model"] == "claude-opus-5"
             assert app.model_name == "claude-opus-5"
+
+    asyncio.run(body())
+
+
+def test_next_approval_mode_cycles_and_wraps():
+    assert next_approval_mode("plan") == "auto"
+    assert next_approval_mode("auto") == "yolo"
+    assert next_approval_mode("yolo") == "plan"
+    assert next_approval_mode("bogus") == "plan"  # unknown -> back to the start
+
+
+def test_shift_tab_cycles_approval_mode():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            assert app.approval_mode == "auto"
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.approval_mode == "yolo"
+            assert app._footer_model.content.plain.endswith("mode: yolo")
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.approval_mode == "plan"
+
+    asyncio.run(body())
+
+
+def test_slash_mode_sets_and_rejects_bad_value():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            app._handle_slash_command("/mode plan")
+            await pilot.pause()
+            assert app.approval_mode == "plan"
+            assert any("approval mode set to 'plan'" in t for t in _static_texts(app))
+
+            app._handle_slash_command("/mode bogus")
+            await pilot.pause()
+            assert app.approval_mode == "plan"  # unchanged
+            assert any("usage: /mode" in t for t in _static_texts(app))
+
+    asyncio.run(body())
+
+
+def test_confirm_bash_approve_and_deny():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test(size=(90, 40)) as pilot:
+            result: dict = {}
+
+            def ask():
+                result["approved"] = app.confirm_bash("rm -rf /tmp/x")
+
+            t = threading.Thread(target=ask, daemon=True)
+            t.start()
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if isinstance(app.screen, tui.ConfirmScreen):
+                    break
+            assert isinstance(app.screen, tui.ConfirmScreen)
+            screen_texts = [
+                w.content.plain if isinstance(w.content, Text) else str(w.content)
+                for w in app.screen.query(Static)
+            ]
+            assert any("rm -rf /tmp/x" in t for t in screen_texts)
+            await pilot.click("#c-deny")
+            t.join(timeout=2)
+            assert result["approved"] is False
+
+            def ask_again():
+                result["approved"] = app.confirm_bash("ls")
+
+            t2 = threading.Thread(target=ask_again, daemon=True)
+            t2.start()
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if isinstance(app.screen, tui.ConfirmScreen):
+                    break
+            assert isinstance(app.screen, tui.ConfirmScreen)
+            await pilot.click("#c-approve")
+            t2.join(timeout=2)
+            assert result["approved"] is True
 
     asyncio.run(body())

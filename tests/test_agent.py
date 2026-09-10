@@ -92,6 +92,97 @@ def _call(name, args, cid="c1"):
     return {"content": "", "tool_calls": [{"id": cid, "function": {"name": name, "arguments": _j.dumps(args)}}]}
 
 
+class _FakeApprovalRenderer:
+    """Minimal duck-typed renderer stub for testing the bash approval gate."""
+
+    def __init__(self, approval_mode="yolo", approve=True):
+        self.approval_mode = approval_mode
+        self._approve = approve
+        self.confirm_calls: list[str] = []
+
+    def step(self, *a, **k): pass
+    def tool_call(self, *a, **k): pass
+    def tool_result(self, *a, **k): pass
+    def begin_tools(self, *a, **k): pass
+    def end_tools(self, *a, **k): pass
+    def final(self, *a, **k): pass
+
+    def confirm_bash(self, command):
+        self.confirm_calls.append(command)
+        return self._approve
+
+
+def test_bash_needs_confirmation_decision_table():
+    plan = SimpleNamespace(approval_mode="plan")
+    auto = SimpleNamespace(approval_mode="auto")
+    yolo = SimpleNamespace(approval_mode="yolo")
+    bare = SimpleNamespace()  # no approval_mode at all -> behaves like yolo
+
+    assert agent._bash_needs_confirmation(plan, {}) is True
+    assert agent._bash_needs_confirmation(plan, {"risk": "safe"}) is True
+    assert agent._bash_needs_confirmation(auto, {"risk": "confirm"}) is True
+    assert agent._bash_needs_confirmation(auto, {"risk": "safe"}) is False
+    assert agent._bash_needs_confirmation(auto, {}) is False  # missing risk defaults to safe
+    assert agent._bash_needs_confirmation(yolo, {"risk": "confirm"}) is False
+    assert agent._bash_needs_confirmation(bare, {"risk": "confirm"}) is False
+
+
+def test_plan_mode_denies_bash_without_running_it(tmp_path, monkeypatch):
+    calls = [_call("bash", {"command": "rm -rf build"}), _call("done", {"summary": "gave up"})]
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0))
+    dispatch_calls = []
+    monkeypatch.setattr(agent, "dispatch", lambda *a, **k: dispatch_calls.append(a) or "ok")
+    renderer = _FakeApprovalRenderer(approval_mode="plan", approve=False)
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=3, renderer=renderer)
+    assert result == "gave up"
+    assert dispatch_calls == []  # denied before it ever ran
+    assert renderer.confirm_calls == ["rm -rf build"]
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert any("denied_by_user" in m["content"] for m in tool_msgs)
+
+
+def test_plan_mode_runs_bash_once_approved(tmp_path, monkeypatch):
+    calls = [_call("bash", {"command": "ls"}), _call("done", {"summary": "done"})]
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0))
+    dispatch_calls = []
+    monkeypatch.setattr(agent, "dispatch", lambda *a, **k: dispatch_calls.append(a) or "ok: ls ran")
+    renderer = _FakeApprovalRenderer(approval_mode="plan", approve=True)
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=3, renderer=renderer)
+    assert result == "done"
+    assert len(dispatch_calls) == 1
+    assert renderer.confirm_calls == ["ls"]
+
+
+def test_auto_mode_only_confirms_calls_the_model_flags_risky(tmp_path, monkeypatch):
+    calls = [
+        _call("bash", {"command": "pytest -q", "risk": "safe"}, cid="c1"),
+        _call("bash", {"command": "rm -rf build", "risk": "confirm"}, cid="c2"),
+        _call("done", {"summary": "done"}, cid="c3"),
+    ]
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0))
+    dispatch_calls = []
+    monkeypatch.setattr(agent, "dispatch", lambda *a, **k: dispatch_calls.append(a) or "ok")
+    renderer = _FakeApprovalRenderer(approval_mode="auto", approve=True)
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=4, renderer=renderer)
+    assert result == "done"
+    assert renderer.confirm_calls == ["rm -rf build"]  # only the risky one
+    assert len(dispatch_calls) == 2  # both ran: the safe one unprompted, the risky one after approval
+
+
+def test_yolo_mode_never_confirms(tmp_path, monkeypatch):
+    calls = [_call("bash", {"command": "rm -rf build", "risk": "confirm"}), _call("done", {"summary": "done"})]
+    monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0))
+    monkeypatch.setattr(agent, "dispatch", lambda *a, **k: "ok")
+    renderer = _FakeApprovalRenderer(approval_mode="yolo", approve=False)
+    messages = agent.new_conversation("t", tmp_path)
+    result = agent.drive(messages, tmp_path, max_steps=3, renderer=renderer)
+    assert result == "done"
+    assert renderer.confirm_calls == []
+
+
 def test_run_stops_on_repeated_calls(tmp_path, monkeypatch):
     calls = [_call("bash", {"command": "echo hi"})] * 5
     monkeypatch.setattr(agent, "llm_call", lambda *a, **k: calls.pop(0) if calls else _call("done", {"summary": "x"}))
