@@ -11,7 +11,7 @@ from textual.widgets import Collapsible, Input, Select, Static
 
 import model_registry as mr
 import tui
-from tui import TuiRenderer, _arg_hint, format_file_diff, format_footer, format_status, summarize_batch
+from tui import TuiRenderer, _arg_hint, format_file_diff, format_footer, format_status, run_title, summarize_batch
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +56,25 @@ def test_summarize_batch():
     assert err2 is False
     text3, _ = summarize_batch([("bash", "echo hi", True)])
     assert text3 == "ran: echo hi"
+
+
+def test_run_title_paginated_reads_of_same_file():
+    title = run_title("read_file", ["pr7590.diff"] * 11, False)
+    assert title == "✔ read pr7590.diff (11 reads)"
+
+
+def test_run_title_multiple_distinct_files():
+    title = run_title("read_file", ["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"], False)
+    assert title == "✔ read 6 files: a.py, b.py, c.py, d.py +2 more"
+
+
+def test_run_title_single_read():
+    assert run_title("read_file", ["a.py"], False) == "✔ read a.py"
+
+
+def test_run_title_bash_commands():
+    assert run_title("bash", ["ls", "pytest -q"], False) == "✔ ran 2 commands"
+    assert run_title("bash", ["ls"], True) == "✖ ran 1 command"
 
 
 def test_format_file_diff_unified():
@@ -187,6 +206,141 @@ def test_multiple_reads_in_one_step_collapse_into_one_running_line():
             assert any(t == "  tool: read a.py, b.py, c.py" for t in texts)
             # no per-read result lines, and no separate per-file "tool: read" lines
             assert sum(1 for t in texts if t.startswith("  tool: read")) == 1
+
+    asyncio.run(body())
+
+
+def test_paginated_reads_across_separate_steps_collapse_into_one_collapsible():
+    """The reported bug: a paginated read (one read_file call per agent
+    step, e.g. re-reading the same file with offset=) used to leave one
+    "read x" collapsible per step instead of collapsing into one."""
+
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            done = threading.Event()
+
+            def work():
+                for _ in range(11):
+                    app.begin_tools(1)
+                    app.tool_call(1, "read_file", '{"path": "pr7590.diff"}')
+                    app.tool_result("read_file", "lines 1-500 of 5000\n...")
+                    app.end_tools()
+                done.set()
+
+            threading.Thread(target=work, daemon=True).start()
+            while not done.is_set():
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            await pilot.pause()
+
+            collapsibles = list(app.query(Collapsible))
+            assert len(collapsibles) == 1
+            assert str(collapsibles[0].title) == "✔ read pr7590.diff (11 reads)"
+            # expanding it still shows every individual call, not just the last
+            detail_texts = [
+                w.content.plain if isinstance(w.content, Text) else str(w.content)
+                for w in collapsibles[0].query(Static)
+            ]
+            assert sum(1 for t in detail_texts if "tool: read" in t) == 11
+
+    asyncio.run(body())
+
+
+def test_repeated_bash_calls_across_steps_collapse_and_expand():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            done = threading.Event()
+
+            def work():
+                for cmd in ("pytest -q", "pytest -x", "echo done"):
+                    app.begin_tools(1)
+                    app.tool_call(1, "bash", f'{{"command": "{cmd}"}}')
+                    app.tool_result("bash", "exit=0\nok")
+                    app.end_tools()
+                done.set()
+
+            threading.Thread(target=work, daemon=True).start()
+            while not done.is_set():
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            await pilot.pause()
+
+            collapsibles = list(app.query(Collapsible))
+            assert len(collapsibles) == 1
+            assert str(collapsibles[0].title) == "✔ ran 3 commands"
+            detail_texts = [
+                w.content.plain if isinstance(w.content, Text) else str(w.content)
+                for w in collapsibles[0].query(Static)
+            ]
+            assert any("pytest -q" in t for t in detail_texts)
+            assert any("pytest -x" in t for t in detail_texts)
+            assert any("echo done" in t for t in detail_texts)
+
+    asyncio.run(body())
+
+
+def test_bash_error_marks_the_whole_run_as_errored():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            done = threading.Event()
+
+            def work():
+                app.begin_tools(1)
+                app.tool_call(1, "bash", '{"command": "ls"}')
+                app.tool_result("bash", "exit=0\nok")
+                app.end_tools()
+                app.begin_tools(2)
+                app.tool_call(2, "bash", '{"command": "pytest -q"}')
+                app.tool_result("bash", "error: exit=1\nboom")
+                app.end_tools()
+                done.set()
+
+            threading.Thread(target=work, daemon=True).start()
+            while not done.is_set():
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            await pilot.pause()
+
+            collapsibles = list(app.query(Collapsible))
+            assert len(collapsibles) == 1
+            assert str(collapsibles[0].title) == "✖ ran 2 commands"
+
+    asyncio.run(body())
+
+
+def test_a_different_tool_kind_breaks_the_run():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            done = threading.Event()
+
+            def work():
+                app.begin_tools(1)
+                app.tool_call(1, "read_file", '{"path": "a.py"}')
+                app.tool_result("read_file", "lines 1-1 of 1\nx")
+                app.end_tools()
+                app.begin_tools(2)
+                app.tool_call(2, "bash", '{"command": "ls"}')
+                app.tool_result("bash", "exit=0\nok")
+                app.end_tools()
+                app.begin_tools(3)
+                app.tool_call(3, "read_file", '{"path": "b.py"}')
+                app.tool_result("read_file", "lines 1-1 of 1\ny")
+                app.end_tools()
+                done.set()
+
+            threading.Thread(target=work, daemon=True).start()
+            while not done.is_set():
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            await pilot.pause()
+
+            collapsibles = list(app.query(Collapsible))
+            # read run, then bash run, then a fresh read run — not merged across the bash
+            assert [str(c.title) for c in collapsibles] == ["✔ read a.py", "✔ ran 1 command", "✔ read b.py"]
 
     asyncio.run(body())
 

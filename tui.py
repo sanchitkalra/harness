@@ -128,6 +128,28 @@ def summarize_batch(entries: list[tuple[str, str, bool]]) -> tuple[str, bool]:
     return (" · ".join(parts)) or "tools", errors > 0
 
 
+RUNNABLE_KINDS = ("read_file", "bash")  # tool kinds that collapse into one running summary
+
+
+def run_title(kind: str, hints: list[str], has_error: bool) -> str:
+    """Title for a cross-step collapsed run of same-kind tool calls
+    (repeated read_file or bash calls). Pure so it's unit-testable."""
+    marker = "✖" if has_error else "✔"
+    n = len(hints)
+    if kind == "read_file":
+        uniq = list(dict.fromkeys(hints))
+        if len(uniq) == 1:
+            body = uniq[0] if n == 1 else f"{uniq[0]} ({_plural(n, 'read')})"
+            body = f"read {body}"
+        else:
+            shown = uniq[:4]
+            more = f" +{len(uniq) - len(shown)} more" if len(uniq) > len(shown) else ""
+            body = f"read {n} files: {', '.join(shown)}{more}"
+    else:  # bash
+        body = f"ran {_plural(n, 'command')}"
+    return f"{marker} {body}"
+
+
 SLASH_COMMANDS: dict[str, str] = {
     "help": "list available commands",
     "name": "rename this session (shown in the status bar)",
@@ -427,6 +449,13 @@ class TuiRenderer(App):
         self._batch: list[dict] | None = None
         self._read_widget: Static | None = None
         self._read_hints: list[str] = []
+        # Cross-step run: consecutive steps that are each a single read_file
+        # (or bash) batch collapse into one growing Collapsible instead of
+        # one per step — a paginated multi-call read shouldn't cost N rows.
+        self._run_kind: str | None = None
+        self._run_collapsible: Collapsible | None = None
+        self._run_hints: list[str] = []
+        self._run_has_error = False
         self._transcript: VerticalScroll | None = None
         self._status: Static | None = None
         self._input: "PromptInput | None" = None
@@ -522,6 +551,8 @@ class TuiRenderer(App):
     def _clear_transcript(self) -> None:
         for child in list(self._transcript.children):
             child.remove()
+        self._run_kind = None
+        self._run_collapsible = None
         self._mount_line("[cleared] new conversation started", "dim")
 
     def _set_input_enabled(self, enabled: bool) -> None:
@@ -618,6 +649,19 @@ class TuiRenderer(App):
             matched["widgets"].extend(new_widgets)
             matched["details"].extend(new_details)
 
+    def _extend_run(self, others: list[dict], kind: str) -> None:
+        collapsible = self._run_collapsible
+        contents = collapsible.query_one(Collapsible.Contents)
+        for e in others:
+            self._run_hints.append(e["hint"] or "?")
+            if not e["ok"]:
+                self._run_has_error = True
+            for dkind, dtext in e["details"]:
+                contents.mount(Static(Text(dtext), classes=dkind))
+        collapsible.title = run_title(kind, self._run_hints, self._run_has_error)
+        collapsible.set_class(self._run_has_error, "err")
+        collapsible.set_class(not self._run_has_error, "ok")
+
     def end_tools(self) -> None:
         batch = self._batch
         self._batch = None
@@ -631,21 +675,38 @@ class TuiRenderer(App):
                 if not is_edit(e):
                     for w in e["widgets"]:
                         w.remove()
-            if others:
-                text, has_error = summarize_batch([(e["name"], e["hint"], e["ok"]) for e in others])
-                marker = "✖" if has_error else "✔"
-                detail_widgets = []
-                for e in others:
-                    for kind, dtext in e["details"]:
-                        detail_widgets.append(Static(Text(dtext), classes=kind))
-                collapsible = Collapsible(
-                    *detail_widgets,
-                    title=f"{marker} {text}",
-                    collapsed=True,
-                    classes="err" if has_error else "ok",
-                )
-                self._transcript.mount(collapsible)
+            if not others:
+                return
+            names = {e["name"] for e in others}
+            kind = next(iter(names)) if len(names) == 1 and next(iter(names)) in RUNNABLE_KINDS else None
+
+            if kind is not None and kind == self._run_kind and self._run_collapsible is not None:
+                self._extend_run(others, kind)
                 self._transcript.scroll_end(animate=False)
+                return
+
+            text, has_error = summarize_batch([(e["name"], e["hint"], e["ok"]) for e in others])
+            detail_widgets = []
+            for e in others:
+                for dkind, dtext in e["details"]:
+                    detail_widgets.append(Static(Text(dtext), classes=dkind))
+            title = run_title(kind, [e["hint"] or "?" for e in others], has_error) if kind else f"{'✖' if has_error else '✔'} {text}"
+            collapsible = Collapsible(
+                *detail_widgets,
+                title=title,
+                collapsed=True,
+                classes="err" if has_error else "ok",
+            )
+            self._transcript.mount(collapsible)
+            self._transcript.scroll_end(animate=False)
+            if kind is not None:
+                self._run_kind = kind
+                self._run_collapsible = collapsible
+                self._run_hints = [e["hint"] or "?" for e in others]
+                self._run_has_error = has_error
+            else:
+                self._run_kind = None
+                self._run_collapsible = None
 
         self.call_from_thread(finish)
 
