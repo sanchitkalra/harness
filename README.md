@@ -86,16 +86,19 @@ different approach instead of getting stuck. This only applies to the TUI —
 plain/one-shot runs (`--no-tui`, `--no-interactive`) always behave like yolo
 since there's no one there to ask.
 
-## Rig as an MCP server (offload cheap work from a bigger harness)
+## Rig as an MCP server (delegate small tasks from a bigger harness)
 
 `rig-mcp --workspace .` runs Rig as an MCP stdio server exposing one tool,
 `delegate_task_tool(task, max_steps?)`, so a bigger coding harness (e.g.
-Claude Code) can hand off low-effort work to whichever model *you've*
-configured Rig to use — typically a free/local one via `/login`'s
-`compatible` provider — without switching models in the bigger harness or
-spending its budget on grunt work. Point your harness's MCP config at
-`rig-mcp` with `--workspace <project>` args, per-project like any other
-local dev-tool MCP server.
+Claude Code) can hand off small, well-scoped tasks — not just drudge work,
+anything with a clear, checkable outcome you can fully specify in one
+instruction: read/summarize a file, run the tests, make a targeted edit,
+search the codebase for something specific — to whichever model *you've*
+configured Rig to use, typically a free/local one via `/login`'s
+`compatible` provider, without switching models or spending its own budget
+on work that doesn't need it. Point your harness's MCP config at `rig-mcp`
+with `--workspace <project>` args, per-project like any other local
+dev-tool MCP server.
 
 Each call is stateless (a fresh conversation) and silent (no transcript —
 stdout is the wire protocol). There's no human on the other end of an MCP

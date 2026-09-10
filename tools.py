@@ -25,6 +25,29 @@ RETRY_BASE_S = 1.0
 RETRY_CAP_S = 8.0
 BLOCKED_BASH_PATTERNS = ["rm -rf /", "rm -rf ~", ":(){", "mkfs", "dd of=/dev"]
 
+# Force-push and direct pushes to main/master are hard-blocked regardless of
+# the model's self-reported bash "risk" arg (see model.py) — that self-report
+# is the model's own judgment call and isn't reliable enough for irreversible,
+# shared-history operations. Everything else (plain push, gh pr create, ...)
+# is intentionally left alone; only these two patterns get a deterministic
+# check that doesn't depend on the model classifying itself correctly.
+_GIT_PUSH_RE = re.compile(r"(?:^|[;&|]|\s)git\s+push\b(.*)$")
+_FORCE_FLAG_RE = re.compile(r"(^|\s)(--force\b|--force-with-lease\b|-f\b)")
+_MAIN_BRANCH_RE = re.compile(r"\bgit\s+push\b.*\b(main|master)\b")
+
+
+def _blocked_git_reason(command: str) -> str | None:
+    for segment in re.split(r"&&|\|\||[;|\n]", command):
+        m = _GIT_PUSH_RE.search(segment)
+        if not m:
+            continue
+        if _FORCE_FLAG_RE.search(m.group(1)):
+            return "git push --force (or -f/--force-with-lease) is always blocked"
+        if _MAIN_BRANCH_RE.search(segment):
+            return "git push directly to main/master is always blocked"
+    return None
+
+
 TOOLS = [
     {
         "name": "read_file",
@@ -47,8 +70,10 @@ TOOLS = [
             "Run a shell command with cwd=workspace. Returns exit code, stdout, stderr. "
             "In auto approval mode, the harness asks the user to confirm any call with "
             "risk='confirm' before running it; set it for anything destructive or hard to "
-            "undo (rm, force-push, migrations, installs/upgrades, network writes) and "
-            "leave it 'safe' (the default) for routine reads/builds/tests."
+            "undo (rm, force-push, pushing to a protected/main branch, migrations, "
+            "installs/upgrades, credential or secret handling). Routine git/GitHub "
+            "workflow commands — pushing a feature branch, opening or updating a PR via "
+            "gh — are 'safe' (the default), not risky; so are routine reads/builds/tests."
         ),
         "parameters": {
             "command": "e.g. pytest -q",
@@ -206,6 +231,9 @@ def tool_bash(root: Path, command: str, timeout_s: float = DEFAULT_TIMEOUT_S) ->
     for pat in BLOCKED_BASH_PATTERNS:
         if pat in command:
             return f"error: blocked: command contains {pat!r}; try something narrower"
+    git_reason = _blocked_git_reason(command)
+    if git_reason:
+        return f"error: blocked: {git_reason}"
     try:
         proc = subprocess.run(
             command, shell=True, cwd=root, capture_output=True,

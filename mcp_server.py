@@ -1,7 +1,8 @@
 """Rig as an MCP server: exposes one tool, delegate_task, so a bigger coding
-harness (e.g. Claude Code) can hand off cheap/low-effort work to whatever
-model Rig is logged into — typically a local/on-device one via /login's
-"compatible" provider — without switching models in the bigger harness.
+harness (e.g. Claude Code) can hand off small, well-scoped tasks to whatever
+model Rig is logged into — typically a free/local one via /login's
+"compatible" provider — without switching models or spending its own
+budget on work that doesn't need it.
 
 Fixed at launch: the workspace (a per-project MCP server config, like any
 other local dev-tool MCP server, not a caller-supplied path). Stateless per
@@ -56,11 +57,19 @@ def build_server(workspace: Path) -> FastMCP:
 
     @mcp.tool()
     def delegate_task_tool(task: str, max_steps: int = agent.DEFAULT_MAX_STEPS) -> str:
-        """Hand off a coding task to Rig's own (typically cheap/local) model —
-        for low-effort work you'd rather not spend your main model's budget
-        on. Runs inside this server's fixed workspace and returns Rig's
-        final result summary. A bash command Rig's model flags as risky is
-        refused rather than run unsupervised or asked about interactively."""
+        """Delegate a small, self-contained coding task to Rig's own agent
+        loop and model (often a free/local one) instead of spending your
+        own budget on it. Not just drudge work — any well-scoped task with
+        a clear, checkable outcome you can fully specify in one instruction:
+        read/summarize a file, run the tests and report results, make one
+        targeted edit, search the codebase for something specific, and so
+        on. Not a fit for open-ended, ambiguous, or judgment-heavy work, or
+        anything spanning many files/decisions. Runs inside this server's
+        fixed workspace using its own read/edit/write/bash tools. State
+        explicitly what the answer/result should be — that's what's
+        returned via its `done` call. A bash command it flags as risky is
+        refused outright rather than run unsupervised or asked about
+        interactively."""
         return delegate_task(workspace, task, max_steps)
 
     return mcp

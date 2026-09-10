@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agent
+import tools
 
 
 def test_sandbox_blocks_escape(tmp_path):
@@ -85,6 +86,45 @@ def test_dispatch_structured_errors(tmp_path):
 def test_bash_blocked_and_missing(tmp_path):
     assert "blocked" in agent.tool_bash(tmp_path, "rm -rf / tmp")
     assert "missing_arg" in agent.tool_bash(tmp_path, "  ")
+
+
+def test_git_force_push_always_blocked_regardless_of_model_risk_claim(tmp_path):
+    """Deterministic backstop: unlike other bash commands, this doesn't
+    depend on the model's own risk="safe"/"confirm" self-report — a model
+    that misjudges a force-push as safe (verified to happen in practice)
+    must not be able to bypass this."""
+    assert "blocked" in agent.tool_bash(tmp_path, "git push --force origin feature-x")
+    assert "blocked" in agent.tool_bash(tmp_path, "git push -f origin feature-x")
+    assert "blocked" in agent.tool_bash(tmp_path, "git push --force-with-lease origin feature-x")
+
+
+def test_git_push_to_main_or_master_always_blocked(tmp_path):
+    assert "blocked" in agent.tool_bash(tmp_path, "git push origin main")
+    assert "blocked" in agent.tool_bash(tmp_path, "git push origin master")
+
+
+def test_routine_git_and_gh_commands_are_not_blocked(tmp_path):
+    """The whole point of narrowing this: plain feature-branch pushes and
+    gh PR commands must NOT be treated as risky just for touching git/GitHub."""
+    assert "blocked" not in agent.tool_bash(tmp_path, "git status")
+    ok = agent.tool_bash(tmp_path, "echo git push origin feature-x")  # not an actual git push
+    assert "blocked" not in ok
+    reason = tools._blocked_git_reason("git push origin feature-x")
+    assert reason is None
+    reason2 = tools._blocked_git_reason("gh pr create --title x --body y")
+    assert reason2 is None
+
+
+def test_force_push_chained_with_other_commands_still_blocked(tmp_path):
+    reason = tools._blocked_git_reason("pytest -q && git push --force origin main")
+    assert reason is not None
+
+
+def test_unrelated_dash_f_flag_does_not_false_positive(tmp_path):
+    """A -f on some other command in the same line must not be mistaken for
+    git push -f just because both appear in the string."""
+    reason = tools._blocked_git_reason("git push origin feature-x && rm -f scratch.txt")
+    assert reason is None
 
 
 def _call(name, args, cid="c1"):
