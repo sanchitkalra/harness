@@ -2,13 +2,14 @@
 name = "rig"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["textual>=0.60"]
+dependencies = ["textual>=0.60", "mcp>=1.6,<2"]
 
 [project.scripts]
 rig = "agent:main"
+rig-mcp = "mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["agent", "model", "model_registry", "tools", "ui", "tui"]
+py-modules = ["agent", "model", "model_registry", "tools", "ui", "tui", "mcp_server"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

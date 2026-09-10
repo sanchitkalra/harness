@@ -86,6 +86,24 @@ different approach instead of getting stuck. This only applies to the TUI —
 plain/one-shot runs (`--no-tui`, `--no-interactive`) always behave like yolo
 since there's no one there to ask.
 
+## Rig as an MCP server (offload cheap work from a bigger harness)
+
+`rig-mcp --workspace .` runs Rig as an MCP stdio server exposing one tool,
+`delegate_task_tool(task, max_steps?)`, so a bigger coding harness (e.g.
+Claude Code) can hand off low-effort work to whichever model *you've*
+configured Rig to use — typically a free/local one via `/login`'s
+`compatible` provider — without switching models in the bigger harness or
+spending its budget on grunt work. Point your harness's MCP config at
+`rig-mcp` with `--workspace <project>` args, per-project like any other
+local dev-tool MCP server.
+
+Each call is stateless (a fresh conversation) and silent (no transcript —
+stdout is the wire protocol). There's no human on the other end of an MCP
+call, so bash approval runs in `auto` mode with a twist: a command the model
+flags `risk="confirm"` is refused outright rather than run unsupervised or
+left hanging waiting for an approval nobody can give — the model sees the
+denial and can retry a safer way.
+
 ## What's inside (learning map)
 
 - `model.py` — `resolve_provider()` picks a `Provider` strategy (`OpenAIProvider` / `AnthropicProvider`) from env vars, then the saved registry; `llm_call()` calls it. Knows nothing about tools or files. Add a provider by writing a class with `model` + `call(messages, tools)` and wiring it into `resolve_provider()`.

@@ -270,9 +270,16 @@ def _stop(log_path: Path | None, step: int, msg: str) -> str:
     return msg
 
 
-def run(task: str, root: Path, max_steps: int = DEFAULT_MAX_STEPS, log_path: Path | None = None, parent_id: str | None = None) -> str:
+def run(
+    task: str,
+    root: Path,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    log_path: Path | None = None,
+    parent_id: str | None = None,
+    renderer: ui.Renderer | None = None,
+) -> str:
     messages = new_conversation(task, root)
-    return drive(messages, root, max_steps, log_path, parent_id)
+    return drive(messages, root, max_steps, log_path, parent_id, renderer=renderer)
 
 
 def log(path: Path | None, entry: dict) -> None:
