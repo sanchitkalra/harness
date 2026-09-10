@@ -49,7 +49,11 @@ SYSTEM = (
     "Call done with a short summary when finished. "
     "When the task is verified, call done immediately — do not keep narrating. "
     "If a tool returns an error, fix your approach instead of repeating it. "
-    "You may update MEMORY.md via edit_file/write_file to persist durable facts across sessions."
+    "You may update MEMORY.md via edit_file/write_file to persist durable facts across sessions. "
+    "MEMORY.md is read into every future session's context, so only write what will "
+    "generalize: a reusable search strategy, a recurring gotcha, a structural fact about "
+    "the codebase. Never record a one-off bug's fix or file location once it's fixed — "
+    "that won't recur and just wastes context. When in doubt, don't write."
 )
 
 
@@ -169,8 +173,8 @@ def drive(
             return _stop(log_path, step, f"stopped: api ({e}, {step}/{cap} steps)")
         except NetworkError as e:  # network down even after retries: stop, don't crash
             return _stop(log_path, step, f"stopped: network ({e}, {step}/{cap} steps)")
-        except RuntimeError as e:  # no provider configured — e.g. opened the TUI before /model
-            return _stop(log_path, step, f"stopped: no_provider ({e}); configure one with /model or an API key env var")
+        except RuntimeError as e:  # no provider configured — e.g. opened the TUI before /login
+            return _stop(log_path, step, f"stopped: no_provider ({e}); configure one with /login or an API key env var")
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         text = (msg.get("content") or "").strip()
@@ -376,7 +380,7 @@ def main() -> None:
     try:
         resolve_provider()
     except RuntimeError as e:
-        # The TUI has a /model command to configure a provider after opening,
+        # The TUI has a /login command to configure a provider after opening,
         # so let it start unconfigured; every other mode has no such escape
         # hatch and should fail fast instead of crashing on the first call.
         if not will_use_tui:

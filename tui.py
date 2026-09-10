@@ -19,10 +19,13 @@ import re
 import threading
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Collapsible, Input, Select, Static
+from textual.widgets import Button, Collapsible, Input, Select, Static, TextArea
 
 import model_registry
 
@@ -31,21 +34,23 @@ import model_registry
 # ----------------------------------------------------------------------
 
 
-def format_status(
-    model_name: str,
-    step_count: int | None = None,
-    session_id: str | None = None,
-    session_name: str | None = None,
-) -> str:
+def format_status(step_count: int, step_total: int | None = None) -> str:
+    try:
+        steps = int(step_count)
+    except Exception:
+        steps = 0
+    if step_total:
+        return f"step {steps}/{int(step_total)}"
+    return f"step {steps}"
+
+
+def format_footer(session_name: str, session_id: str, group_name: str, model_name: str) -> tuple[str, str]:
+    """(session line, group/model line) shown under the input box."""
+    session_line = (session_name or "").strip() or (session_id or "").strip() or "(unnamed session)"
+    group = (group_name or "").strip()
     model = str(model_name or "unknown").strip() or "unknown"
-    steps = 0
-    if step_count is not None:
-        try:
-            steps = int(step_count)
-        except Exception:
-            steps = 0
-    label = (session_name or "").strip() or (session_id or "").strip()
-    return f"{model} | steps {steps}" + (f" | session: {label}" if label else "")
+    model_line = f"{group}/{model}" if group else model
+    return session_line, model_line
 
 
 def _arg_hint(name: str, args_json: str) -> str:
@@ -128,7 +133,8 @@ SLASH_COMMANDS: dict[str, str] = {
     "name": "rename this session (shown in the status bar)",
     "rename": "alias for /name",
     "clear": "clear the transcript and start a new conversation",
-    "model": "pick or add a saved model profile",
+    "login": "pick or add a login (provider + API key)",
+    "model": "pick or add a model within the current login",
     "quit": "exit the app",
     "exit": "alias for /quit",
 }
@@ -199,39 +205,43 @@ def format_file_diff(diff_lines: list[str], path_hint: str = "") -> tuple[str, s
 
 
 # ----------------------------------------------------------------------
-# ModelPickerScreen — /model: pick a saved profile, or add a new one
+# LoginPickerScreen — /login: pick a saved auth group, or add a new one
 # ----------------------------------------------------------------------
 
-class ModelPickerScreen(ModalScreen[str | None]):
-    """Dismisses with the newly-active profile name, or None if cancelled."""
+_PICKER_CSS = """
+ModalScreen { align: center middle; }
+#picker-box { width: 64; height: auto; border: round $accent; padding: 1 2; background: $panel; }
+#picker-box Input, #picker-box Select { margin-bottom: 1; }
+#add-form { display: none; }
+#add-form.visible { display: block; }
+.picker-err { color: $error; }
+"""
 
-    CSS = """
-    ModelPickerScreen { align: center middle; }
-    #picker-box { width: 64; height: auto; border: round $accent; padding: 1 2; background: $panel; }
-    #picker-box Input, #picker-box Select { margin-bottom: 1; }
-    #add-form { display: none; }
-    #add-form.visible { display: block; }
-    .picker-err { color: $error; }
-    """
+
+class LoginPickerScreen(ModalScreen[str | None]):
+    """Dismisses with the newly-active group name, or None if cancelled."""
+
+    CSS = _PICKER_CSS
     BINDINGS = [("escape", "cancel", "Cancel")]
 
     def __init__(self) -> None:
         super().__init__()
         reg = model_registry.load_registry()
-        self._profiles = reg["profiles"]
-        self._active = reg.get("active")
+        self._groups = reg["groups"]
+        self._active = reg.get("active_group")
 
     def compose(self) -> ComposeResult:
         options = [
-            (f"{name} — {p.get('provider')}/{p.get('model')}" + (" (current)" if name == self._active else ""), name)
-            for name, p in self._profiles.items()
+            (
+                f"{name} — {g.get('provider')} ({model_registry.mask_key(g.get('api_key', ''))})"
+                + (" (current)" if name == self._active else ""),
+                name,
+            )
+            for name, g in self._groups.items()
         ]
-        options.append(("+ Add new profile...", "__add__"))
-        # Deliberately no pre-selected value: Select fires Changed on mount
-        # for any non-blank initial value, which on_select_changed below
-        # would treat as a real pick and dismiss the screen immediately.
+        options.append(("+ Add new login...", "__add__"))
         with Vertical(id="picker-box"):
-            yield Static("Model profiles — enter to select, esc to cancel")
+            yield Static("Logins — enter to select, esc to cancel")
             yield Select(options, id="picker-select", allow_blank=True)
             with Vertical(id="add-form"):
                 yield Input(placeholder="name (e.g. work)", id="f-name")
@@ -240,7 +250,7 @@ class ModelPickerScreen(ModalScreen[str | None]):
                 )
                 yield Input(placeholder="API key", password=True, id="f-key")
                 yield Input(placeholder="model (e.g. claude-sonnet-5)", id="f-model")
-                yield Input(placeholder="base url (optional)", id="f-base")
+                yield Input(placeholder="base url (required for compatible)", id="f-base")
                 yield Button("Save", id="f-save", variant="primary")
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -250,7 +260,7 @@ class ModelPickerScreen(ModalScreen[str | None]):
             self.query_one("#add-form").add_class("visible")
             self.query_one("#f-name", Input).focus()
         elif event.value is not Select.BLANK:
-            model_registry.set_active(event.value)
+            model_registry.set_active_group(event.value)
             self.dismiss(event.value)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -267,11 +277,104 @@ class ModelPickerScreen(ModalScreen[str | None]):
         if not name or provider is Select.BLANK or not api_key or not model_name:
             box.mount(Static("name, provider, API key, and model are required", classes="picker-err"))
             return
-        model_registry.add_profile(name, provider, api_key, model_name, base_url)
+        if provider == "compatible" and not base_url:
+            box.mount(Static("base url is required for a compatible provider", classes="picker-err"))
+            return
+        model_registry.add_group(name, provider, api_key, model_name, base_url)
         self.dismiss(name)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# ----------------------------------------------------------------------
+# ModelPickerScreen — /model: pick a model within the active login, or
+# add a new one to it. Requires an active login (use /login first).
+# ----------------------------------------------------------------------
+
+class ModelPickerScreen(ModalScreen[str | None]):
+    """Dismisses with the newly-active model name, or None if cancelled."""
+
+    CSS = _PICKER_CSS
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._group = model_registry.get_active_group()
+
+    def compose(self) -> ComposeResult:
+        if self._group is None:
+            with Vertical(id="picker-box"):
+                yield Static("No login configured yet — run /login first.", classes="picker-err")
+            return
+        active_model = self._group.get("active_model")
+        options = [
+            (m + (" (current)" if m == active_model else ""), m)
+            for m in self._group.get("models", [])
+        ]
+        options.append(("+ Add new model...", "__add__"))
+        with Vertical(id="picker-box"):
+            yield Static(f"Models for login {self._group['name']!r} — enter to select, esc to cancel")
+            yield Select(options, id="picker-select", allow_blank=True)
+            with Vertical(id="add-form"):
+                yield Input(placeholder="model (e.g. claude-opus-5)", id="f-model")
+                yield Button("Save", id="f-save", variant="primary")
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "picker-select":
+            return
+        if event.value == "__add__":
+            self.query_one("#add-form").add_class("visible")
+            self.query_one("#f-model", Input).focus()
+        elif event.value is not Select.BLANK:
+            model_registry.set_active_model(self._group["name"], event.value)
+            self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "f-save":
+            return
+        model_name = self.query_one("#f-model", Input).value.strip()
+        box = self.query_one("#picker-box")
+        for old in box.query(".picker-err"):
+            old.remove()
+        if not model_name:
+            box.mount(Static("model name is required", classes="picker-err"))
+            return
+        model_registry.add_model(self._group["name"], model_name)
+        self.dismiss(model_name)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ----------------------------------------------------------------------
+# PromptInput — multi-line prompt box. Enter submits, shift+enter inserts
+# a newline; TextArea gives soft-wrap and multi-line height for free.
+# ----------------------------------------------------------------------
+
+class PromptInput(TextArea):
+    class Submitted(Message):
+        def __init__(self, text: str) -> None:
+            self.text = text
+            super().__init__()
+
+    BINDINGS = [Binding("shift+enter", "insert_newline", "New line")]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(show_line_numbers=False, soft_wrap=True, tab_behavior="focus", **kwargs)
+
+    def action_insert_newline(self) -> None:
+        self.insert("\n")
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            text = self.text
+            self.text = ""
+            self.post_message(self.Submitted(text))
+            return
+        await super()._on_key(event)
 
 
 # ----------------------------------------------------------------------
@@ -283,8 +386,9 @@ class TuiRenderer(App):
     marshal onto the UI thread via call_from_thread."""
 
     CSS = """
-    #status { background: $primary-darken-1; color: $text; height: 1; }
-    #transcript { padding: 0 1; }
+    Screen { padding: 0 0 1 0; }
+    #status { background: $primary-darken-1; color: $text; height: 1; margin-bottom: 1; }
+    #transcript { padding: 0 1 1 1; }
     .step { text-style: bold; }
     .tool { color: $text-muted; }
     .ok { color: $success; }
@@ -294,12 +398,15 @@ class TuiRenderer(App):
     .add { background: $success-muted; color: $text; }
     .del { background: $error-muted; color: $text; }
     .result { text-style: bold; }
-    .usermsg { border: round $accent; padding: 0 1; margin: 0 0; }
-    Collapsible { padding: 0; margin: 0; }
+    .usermsg { border: round $accent; padding: 0 1; margin: 0 0 1 0; }
+    Collapsible { padding: 0; margin: 0 0 1 0; }
     Collapsible.err > CollapsibleTitle { color: $error; }
     Collapsible.ok > CollapsibleTitle { color: $success; }
-    #hints { color: $text-muted; padding: 0 1; height: auto; display: none; }
+    #hints { color: $text-muted; padding: 0 1; height: auto; display: none; margin-bottom: 1; }
     #hints.visible { display: block; }
+    #input { height: auto; max-height: 10; margin-bottom: 1; }
+    #footer-session { color: $text-muted; padding: 0 1; height: 1; }
+    #footer-model { color: $text-muted; padding: 0 1; height: 1; }
     """
     # ponytail: quit is only reachable between turns (queue-driven), not while
     # a turn is running on the worker thread — Python can't deliver a signal
@@ -312,13 +419,20 @@ class TuiRenderer(App):
         self.model_name = model_name or "unknown"
         self.session_id = session_id or ""
         self.session_name = ""
+        active_group = model_registry.get_active_group()
+        self.group_name = active_group["name"] if active_group else ""
         self.step_count = 0
+        self.step_total = 0
         self._input_queue: "queue.Queue[str | None]" = queue.Queue()
         self._batch: list[dict] | None = None
+        self._read_widget: Static | None = None
+        self._read_hints: list[str] = []
         self._transcript: VerticalScroll | None = None
         self._status: Static | None = None
-        self._input: Input | None = None
+        self._input: "PromptInput | None" = None
         self._hints: Static | None = None
+        self._footer_session: Static | None = None
+        self._footer_model: Static | None = None
         # Set once the app's event loop is actually running — call_from_thread
         # raises if invoked before this, so the session worker thread must
         # wait on it before touching any Renderer method.
@@ -343,21 +457,32 @@ class TuiRenderer(App):
         yield Static(id="status")
         yield VerticalScroll(id="transcript")
         yield Static(id="hints")
-        yield Input(placeholder="type a task, enter to send  ·  / for commands", id="input")
+        yield PromptInput(id="input")
+        yield Static(id="footer-session")
+        yield Static(id="footer-model")
 
     def on_mount(self) -> None:
         self._transcript = self.query_one("#transcript", VerticalScroll)
         self._status = self.query_one("#status", Static)
-        self._input = self.query_one("#input", Input)
+        self._input = self.query_one("#input", PromptInput)
         self._hints = self.query_one("#hints", Static)
+        self._footer_session = self.query_one("#footer-session", Static)
+        self._footer_model = self.query_one("#footer-model", Static)
         self._refresh_status()
-        self._mount_line("Tip: type / to see available commands (e.g. /help).", "dim")
+        self._mount_line(
+            "Tip: type / to see available commands (e.g. /help). Enter to send, shift+enter for a new line.",
+            "dim",
+        )
         self._input.focus()
         self._loop_ready.set()
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        text = event.value
-        if text.startswith("/") and " " not in text:
+    def on_prompt_input_submitted(self, event: "PromptInput.Submitted") -> None:
+        self._hints.set_class(False, "visible")
+        self._input_queue.put(event.text)
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        text = event.text_area.text
+        if text.startswith("/") and " " not in text and "\n" not in text:
             prefix = text[1:].lower()
             matches = [(n, d) for n, d in SLASH_COMMANDS.items() if n.startswith(prefix)]
             if matches:
@@ -366,25 +491,29 @@ class TuiRenderer(App):
                 return
         self._hints.set_class(False, "visible")
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value
-        self._input.value = ""
-        self._hints.set_class(False, "visible")
-        self._input_queue.put(text)
-
     def action_quit_app(self) -> None:
         self._input_queue.put(None)
         self.exit()
 
     def _refresh_status(self) -> None:
         if self._status is not None:
-            self._status.update(Text(format_status(self.model_name, self.step_count, self.session_id, self.session_name)))
+            self._status.update(Text(format_status(self.step_count, self.step_total)))
+        if self._footer_session is not None and self._footer_model is not None:
+            session_line, model_line = format_footer(
+                self.session_name, self.session_id, self.group_name, self.model_name
+            )
+            self._footer_session.update(Text(session_line))
+            self._footer_model.update(Text(model_line))
 
     def _mount_line(self, text: str, cls: str = "") -> Static:
         w = Static(Text(text), classes=cls)
         self._transcript.mount(w)
         self._transcript.scroll_end(animate=False)
         return w
+
+    def _update_line(self, widget: Static, text: str) -> None:
+        widget.update(Text(text))
+        self._transcript.scroll_end(animate=False)
 
     def _mount_user_message(self, text: str) -> None:
         self._transcript.mount(Static(Text(text), classes="usermsg"))
@@ -418,16 +547,33 @@ class TuiRenderer(App):
     def begin_tools(self, step_num: int) -> None:
         self.step_count = step_num
         self._batch = []
+        self._read_widget = None
+        self._read_hints = []
         self.call_from_thread(self._refresh_status)
 
     def tool_call(self, num: int, name: str, args_json: str) -> None:
+        hint = _arg_hint(name, args_json)
+        if name == "read_file" and self._read_widget is not None:
+            # Collapse consecutive reads into one running line instead of
+            # a new one per call — a multi-file read shouldn't cost N lines.
+            self._read_hints.append(hint or "?")
+            call_text = "  tool: read " + ", ".join(self._read_hints)
+            self.call_from_thread(self._update_line, self._read_widget, call_text)
+            if self._batch is not None:
+                self._batch.append({
+                    "name": name, "hint": hint, "ok": True, "_open": True,
+                    "widgets": [], "details": [("tool", call_text)],
+                })
+            return
         truncated = (args_json or "")[:200].replace("\n", " ")
         call_text = f"  tool: {name} {truncated}"
         widget = self.call_from_thread(self._mount_line, call_text, "tool")
+        self._read_widget = widget if name == "read_file" else None
+        self._read_hints = [hint or "?"] if name == "read_file" else []
         if self._batch is not None:
             self._batch.append({
                 "name": name,
-                "hint": _arg_hint(name, args_json),
+                "hint": hint,
                 "ok": True,
                 "_open": True,
                 "widgets": [widget],
@@ -445,6 +591,8 @@ class TuiRenderer(App):
                     entry["ok"] = not is_error
                     matched = entry
                     break
+        if tool_name == "read_file" and not is_error:
+            return  # the running "read x, y" line already covers this
         kind = "err" if is_error else "ok"
         new_widgets: list[Static] = []
         new_details: list[tuple[str, str]] = []
@@ -503,7 +651,7 @@ class TuiRenderer(App):
 
     def step(self, num: int, total: int, text: str) -> None:
         self.step_count = num
-        self.call_from_thread(self._mount_line, f"Step {num}/{total}", "step")
+        self.step_total = total
         stripped = (text or "").strip()
         if stripped:
             self.call_from_thread(self._mount_line, stripped)
@@ -520,10 +668,18 @@ class TuiRenderer(App):
     def _on_model_picked(self, name: str | None) -> None:
         if name is None:
             return
-        profile = model_registry.load_registry()["profiles"].get(name, {})
-        self.model_name = profile.get("model") or self.model_name
+        self.model_name = name
         self._refresh_status()
-        self._mount_line(f"model set to {name!r} ({profile.get('provider')}/{profile.get('model')})", "dim")
+        self._mount_line(f"model set to {name!r}", "dim")
+
+    def _on_login_picked(self, name: str | None) -> None:
+        if name is None:
+            return
+        group = model_registry.get_active_group() or {}
+        self.group_name = name
+        self.model_name = group.get("active_model") or self.model_name
+        self._refresh_status()
+        self._mount_line(f"login set to {name!r} ({group.get('provider')}/{self.model_name})", "dim")
 
     def _handle_slash_command(self, line: str) -> bool:
         """Run a /command mounted on the UI thread. Returns True if the app
@@ -544,6 +700,8 @@ class TuiRenderer(App):
         elif cmd == "clear":
             self._clear_transcript()
             self._clear_requested.set()
+        elif cmd == "login":
+            self.push_screen(LoginPickerScreen(), self._on_login_picked)
         elif cmd == "model":
             self.push_screen(ModelPickerScreen(), self._on_model_picked)
         elif cmd == "help":

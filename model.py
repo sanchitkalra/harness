@@ -288,6 +288,8 @@ def _provider_from_profile(profile: dict) -> Provider:
     base = profile.get("base_url") or None
     if provider == "anthropic":
         return AnthropicProvider(base=base or ANTHROPIC_BASE_URL, model=profile.get("model") or ANTHROPIC_DEFAULT_MODEL, key=key)
+    # "openai" and "compatible" (any OpenAI-wire-format endpoint) both speak
+    # /chat/completions; "compatible" just requires base_url to be set.
     return OpenAIProvider(base=base or "https://api.openai.com/v1", model=profile.get("model") or "gpt-4o-mini", key=key)
 
 

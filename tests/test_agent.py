@@ -507,7 +507,7 @@ def test_run_returns_stopped_when_no_provider_configured(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "llm_call", boom)
     out = agent.run("t", tmp_path, max_steps=3)
     assert out.startswith("stopped: no_provider")
-    assert "/model" in out
+    assert "/login" in out
 
 
 def test_web_search_retries_then_succeeds(tmp_path, monkeypatch):

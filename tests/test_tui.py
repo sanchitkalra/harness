@@ -11,7 +11,7 @@ from textual.widgets import Collapsible, Input, Select, Static
 
 import model_registry as mr
 import tui
-from tui import TuiRenderer, _arg_hint, format_file_diff, format_status, summarize_batch
+from tui import TuiRenderer, _arg_hint, format_file_diff, format_footer, format_status, summarize_batch
 
 
 @pytest.fixture(autouse=True)
@@ -21,11 +21,18 @@ def isolated_registry(tmp_path, monkeypatch):
 
 
 def test_format_status():
-    s = format_status("muse-spark-1.1", 5, "abc123")
-    assert "muse-spark-1.1" in s and "steps 5" in s and "abc123" in s
+    assert format_status(5, 30) == "step 5/30"
+    assert format_status(0) == "step 0"
 
-    s2 = format_status("", None, None)
-    assert "unknown" in s2 and "steps 0" in s2
+
+def test_format_footer():
+    session, model = format_footer("my session", "sess1", "work", "claude-sonnet-5")
+    assert session == "my session"
+    assert model == "work/claude-sonnet-5"
+
+    session2, model2 = format_footer("", "sess1", "", "")
+    assert session2 == "sess1"
+    assert model2 == "unknown"
 
 
 def test_arg_hint():
@@ -124,6 +131,8 @@ def test_renderer_end_to_end_smoke():
             assert "Added 1 line, removed 1 line" in joined
             assert "+ b" in joined
             assert "done ok" in joined
+            # no separate "Step i/n" line in the transcript anymore
+            assert "Step 1/5" not in joined
             # reads collapse behind a summary; edits never do
             assert any("read a.txt" in t for t in texts)
             # the collapsed summary shows the actual command, not just a count
@@ -152,6 +161,53 @@ def test_renderer_end_to_end_smoke():
     asyncio.run(body())
 
 
+def test_multiple_reads_in_one_step_collapse_into_one_running_line():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            done = threading.Event()
+
+            def work():
+                app.begin_tools(1)
+                app.tool_call(1, "read_file", '{"path": "a.py"}')
+                app.tool_result("read_file", "lines 1-1 of 1\nx")
+                app.tool_call(1, "read_file", '{"path": "b.py"}')
+                app.tool_result("read_file", "lines 1-1 of 1\ny")
+                app.tool_call(1, "read_file", '{"path": "c.py"}')
+                app.tool_result("read_file", "lines 1-1 of 1\nz")
+                done.set()
+
+            threading.Thread(target=work, daemon=True).start()
+            while not done.is_set():
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            await pilot.pause()
+
+            texts = _static_texts(app)
+            assert any(t == "  tool: read a.py, b.py, c.py" for t in texts)
+            # no per-read result lines, and no separate per-file "tool: read" lines
+            assert sum(1 for t in texts if t.startswith("  tool: read")) == 1
+
+    asyncio.run(body())
+
+
+def test_footer_shows_session_name_and_group_model():
+    async def body():
+        app = TuiRenderer(model_name="claude-sonnet-5", session_id="sess1")
+        app.group_name = "work"
+        async with app.run_test() as pilot:
+            app._refresh_status()
+            await pilot.pause()
+            assert app._footer_session.content.plain == "sess1"
+            assert app._footer_model.content.plain == "work/claude-sonnet-5"
+
+            app._handle_slash_command("/name my session")
+            await pilot.pause()
+            assert app._footer_session.content.plain == "my session"
+
+    asyncio.run(body())
+
+
 def test_slash_name_command_renames_session_without_reaching_the_agent():
     """/name is intercepted by read_line() and never returned as a task."""
 
@@ -173,12 +229,40 @@ def test_slash_name_command_renames_session_without_reaching_the_agent():
             await asyncio.sleep(0.05)
             assert "line" not in result
             assert app.session_name == "my tests"
-            assert "session: my tests" in app._status.content.plain
+            assert app._footer_session.content.plain == "my tests"
 
             await pilot.click("#input")
             await pilot.press(*"real task", "enter")
             t.join(timeout=2)
             assert result["line"] == "real task"
+
+    asyncio.run(body())
+
+
+def test_shift_enter_inserts_newline_plain_enter_submits():
+    async def body():
+        app = TuiRenderer(model_name="m", session_id="sess1")
+        async with app.run_test() as pilot:
+            result: dict = {}
+
+            def get_line():
+                result["line"] = app.read_line("> ")
+
+            t = threading.Thread(target=get_line, daemon=True)
+            t.start()
+            await pilot.pause()
+            await pilot.click("#input")
+            await pilot.press(*"line one")
+            await pilot.press("shift+enter")
+            await pilot.press(*"line two")
+            await pilot.pause()
+            assert app._input.text == "line one\nline two"
+            assert "line" not in result  # not submitted yet
+
+            await pilot.press("enter")
+            t.join(timeout=2)
+            assert result["line"] == "line one\nline two"
+            assert app._input.text == ""
 
     asyncio.run(body())
 
@@ -271,16 +355,16 @@ def test_hints_show_and_filter_while_typing_a_slash_command():
     asyncio.run(body())
 
 
-def test_slash_model_add_new_profile_and_it_becomes_active():
+def test_slash_login_add_new_group_and_it_becomes_active():
     async def body():
         app = TuiRenderer(model_name="unknown", session_id="sess1")
-        async with app.run_test(size=(90, 30)) as pilot:
-            app._handle_slash_command("/model")
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/login")
             await pilot.pause()
             await pilot.pause()
-            assert isinstance(app.screen, tui.ModelPickerScreen)
+            assert isinstance(app.screen, tui.LoginPickerScreen)
 
-            # no saved profiles yet: only "+ Add new profile..." is offered
+            # no saved logins yet: only "+ Add new login..." is offered
             select = app.screen.query_one("#picker-select", Select)
             select.value = "__add__"
             await pilot.pause()
@@ -293,71 +377,159 @@ def test_slash_model_add_new_profile_and_it_becomes_active():
             await pilot.click("#f-save")
             await pilot.pause()
 
-            assert not isinstance(app.screen, tui.ModelPickerScreen)  # modal closed
+            assert not isinstance(app.screen, tui.LoginPickerScreen)  # modal closed
             reg = mr.load_registry()
-            assert reg["active"] == "work"
-            assert reg["profiles"]["work"]["provider"] == "anthropic"
+            assert reg["active_group"] == "work"
+            assert reg["groups"]["work"]["provider"] == "anthropic"
             texts = _static_texts(app)
-            assert any("model set to 'work'" in t for t in texts)
-            assert "session: sess1" in app._status.content.plain
+            assert any("login set to 'work'" in t for t in texts)
+            assert app.group_name == "work"
             assert app.model_name == "claude-sonnet-5"
 
     asyncio.run(body())
 
 
-def test_slash_model_save_rejects_missing_fields():
+def test_slash_login_compatible_provider_requires_base_url():
     async def body():
         app = TuiRenderer(model_name="unknown", session_id="sess1")
-        async with app.run_test(size=(90, 30)) as pilot:
-            app._handle_slash_command("/model")
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/login")
+            await pilot.pause()
+            await pilot.pause()
+            app.screen.query_one("#picker-select", Select).value = "__add__"
+            await pilot.pause()
+            app.screen.query_one("#f-name", Input).value = "local"
+            app.screen.query_one("#f-provider", Select).value = "compatible"
+            app.screen.query_one("#f-key", Input).value = "k"
+            app.screen.query_one("#f-model", Input).value = "some-model"
+            await pilot.click("#f-save")
+            await pilot.pause()
+
+            assert isinstance(app.screen, tui.LoginPickerScreen)  # still open
+            screen_texts = [
+                w.content.plain if isinstance(w.content, Text) else str(w.content)
+                for w in app.screen.query(Static)
+            ]
+            assert any("base url is required" in t for t in screen_texts)
+            assert mr.load_registry()["groups"] == {}
+
+    asyncio.run(body())
+
+
+def test_slash_login_save_rejects_missing_fields():
+    async def body():
+        app = TuiRenderer(model_name="unknown", session_id="sess1")
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/login")
             await pilot.pause()
             await pilot.pause()
             app.screen.query_one("#picker-select", Select).value = "__add__"
             await pilot.pause()
             await pilot.click("#f-save")  # nothing filled in
             await pilot.pause()
-            assert isinstance(app.screen, tui.ModelPickerScreen)  # still open
+            assert isinstance(app.screen, tui.LoginPickerScreen)  # still open
             screen_texts = [
                 w.content.plain if isinstance(w.content, Text) else str(w.content)
                 for w in app.screen.query(Static)
             ]
             assert any("required" in t for t in screen_texts)
-            assert mr.load_registry()["profiles"] == {}
+            assert mr.load_registry()["groups"] == {}
 
     asyncio.run(body())
 
 
-def test_slash_model_picks_existing_profile():
+def test_slash_login_picks_existing_group():
     async def body():
-        mr.add_profile("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
-        mr.add_profile("cheap", "openai", "sk-oai", "gpt-4o-mini", make_active=False)
+        mr.add_group("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
+        mr.add_group("cheap", "openai", "sk-oai", "gpt-4o-mini", make_active=False)
         app = TuiRenderer(model_name="unknown", session_id="sess1")
-        async with app.run_test(size=(90, 30)) as pilot:
-            app._handle_slash_command("/model")
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/login")
             await pilot.pause()
             await pilot.pause()
             select = app.screen.query_one("#picker-select", Select)
             select.value = "cheap"
             await pilot.pause()
 
-            assert mr.load_registry()["active"] == "cheap"
-            assert any("model set to 'cheap'" in t for t in _static_texts(app))
+            assert mr.load_registry()["active_group"] == "cheap"
+            assert any("login set to 'cheap'" in t for t in _static_texts(app))
+            assert app.group_name == "cheap"
             assert app.model_name == "gpt-4o-mini"
 
     asyncio.run(body())
 
 
-def test_slash_model_cancel_leaves_registry_untouched():
+def test_slash_login_cancel_leaves_registry_untouched():
     async def body():
-        mr.add_profile("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
+        mr.add_group("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
         app = TuiRenderer(model_name="unknown", session_id="sess1")
-        async with app.run_test(size=(90, 30)) as pilot:
-            app._handle_slash_command("/model")
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/login")
             await pilot.pause()
             await pilot.pause()
             await pilot.press("escape")
             await pilot.pause()
+            assert not isinstance(app.screen, tui.LoginPickerScreen)
+            assert mr.load_registry()["active_group"] == "work"  # unchanged
+
+    asyncio.run(body())
+
+
+def test_slash_model_requires_a_login_first():
+    async def body():
+        app = TuiRenderer(model_name="unknown", session_id="sess1")
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, tui.ModelPickerScreen)
+            screen_texts = [
+                w.content.plain if isinstance(w.content, Text) else str(w.content)
+                for w in app.screen.query(Static)
+            ]
+            assert any("run /login first" in t for t in screen_texts)
+
+    asyncio.run(body())
+
+
+def test_slash_model_add_new_model_to_active_login():
+    async def body():
+        mr.add_group("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
+        app = TuiRenderer(model_name="claude-sonnet-5", session_id="sess1")
+        app.group_name = "work"
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            app.screen.query_one("#picker-select", Select).value = "__add__"
+            await pilot.pause()
+            app.screen.query_one("#f-model", Input).value = "claude-opus-5"
+            await pilot.click("#f-save")
+            await pilot.pause()
+
             assert not isinstance(app.screen, tui.ModelPickerScreen)
-            assert mr.load_registry()["active"] == "work"  # unchanged
+            group = mr.get_active_group()
+            assert group["models"] == ["claude-sonnet-5", "claude-opus-5"]
+            assert group["active_model"] == "claude-opus-5"
+            assert app.model_name == "claude-opus-5"
+
+    asyncio.run(body())
+
+
+def test_slash_model_picks_existing_model_within_active_login():
+    async def body():
+        mr.add_group("work", "anthropic", "sk-ant-a", "claude-sonnet-5")
+        mr.add_model("work", "claude-opus-5", make_active=False)
+        app = TuiRenderer(model_name="claude-sonnet-5", session_id="sess1")
+        app.group_name = "work"
+        async with app.run_test(size=(90, 40)) as pilot:
+            app._handle_slash_command("/model")
+            await pilot.pause()
+            await pilot.pause()
+            app.screen.query_one("#picker-select", Select).value = "claude-opus-5"
+            await pilot.pause()
+
+            assert mr.get_active_group()["active_model"] == "claude-opus-5"
+            assert app.model_name == "claude-opus-5"
 
     asyncio.run(body())

@@ -1,9 +1,14 @@
-"""Persisted model config: named (provider, api_key, model) profiles.
+"""Persisted model config: named auth groups (provider + API key), each
+holding one or more model names.
 
-Lets you save credentials once instead of exporting env vars every run.
+Lets you save credentials once instead of exporting env vars every run,
+and flip between models on the same credentials without re-entering a key.
 Storage: ~/.config/harness/models.json, mode 600 (it holds API keys).
 Env vars still take precedence in model.resolve_provider() — this is
 only consulted when none are set.
+
+Shape: {"active_group": name|None, "groups": {name: {provider, api_key,
+base_url, models: [name, ...], active_model: name|None}}}
 """
 from __future__ import annotations
 
@@ -11,23 +16,42 @@ import json
 import os
 from pathlib import Path
 
-PROVIDERS = ("anthropic", "openai")
+PROVIDERS = ("anthropic", "openai", "compatible")
 
 
 def registry_path() -> Path:
     return Path(os.environ.get("HARNESS_CONFIG_DIR", Path.home() / ".config" / "harness")) / "models.json"
 
 
+def _migrate_legacy(data: dict) -> dict:
+    """Old shape was {"active": name, "profiles": {name: {provider, api_key,
+    model, base_url}}} — one model per group. Fold each profile into its
+    own single-model group so existing configs keep working."""
+    groups = {}
+    for name, p in data.get("profiles", {}).items():
+        groups[name] = {
+            "provider": p.get("provider"),
+            "api_key": p.get("api_key", ""),
+            "base_url": p.get("base_url"),
+            "models": [p.get("model")] if p.get("model") else [],
+            "active_model": p.get("model"),
+        }
+    return {"active_group": data.get("active"), "groups": groups}
+
+
 def load_registry() -> dict:
-    """{"active": name|None, "profiles": {name: {provider, api_key, model, base_url}}}."""
     p = registry_path()
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
-            return {"active": data.get("active"), "profiles": data["profiles"]}
     except Exception:
-        pass
-    return {"active": None, "profiles": {}}
+        return {"active_group": None, "groups": {}}
+    if not isinstance(data, dict):
+        return {"active_group": None, "groups": {}}
+    if isinstance(data.get("groups"), dict):
+        return {"active_group": data.get("active_group"), "groups": data["groups"]}
+    if isinstance(data.get("profiles"), dict):
+        return _migrate_legacy(data)
+    return {"active_group": None, "groups": {}}
 
 
 def save_registry(reg: dict) -> None:
@@ -40,38 +64,89 @@ def save_registry(reg: dict) -> None:
         pass  # best-effort on platforms without POSIX perms
 
 
-def add_profile(name: str, provider: str, api_key: str, model: str, base_url: str | None = None, make_active: bool = True) -> None:
+def add_group(
+    name: str,
+    provider: str,
+    api_key: str,
+    model: str,
+    base_url: str | None = None,
+    make_active: bool = True,
+) -> None:
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r}; must be one of {PROVIDERS}")
     reg = load_registry()
-    reg["profiles"][name] = {"provider": provider, "api_key": api_key, "model": model, "base_url": base_url}
-    if make_active or not reg.get("active"):
-        reg["active"] = name
+    reg["groups"][name] = {
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": base_url,
+        "models": [model],
+        "active_model": model,
+    }
+    if make_active or not reg.get("active_group"):
+        reg["active_group"] = name
     save_registry(reg)
 
 
-def remove_profile(name: str) -> None:
+def remove_group(name: str) -> None:
     reg = load_registry()
-    reg["profiles"].pop(name, None)
-    if reg.get("active") == name:
-        reg["active"] = next(iter(reg["profiles"]), None)
+    reg["groups"].pop(name, None)
+    if reg.get("active_group") == name:
+        reg["active_group"] = next(iter(reg["groups"]), None)
     save_registry(reg)
 
 
-def set_active(name: str) -> None:
+def set_active_group(name: str) -> None:
     reg = load_registry()
-    if name not in reg["profiles"]:
-        raise KeyError(f"no saved profile named {name!r}")
-    reg["active"] = name
+    if name not in reg["groups"]:
+        raise KeyError(f"no saved login named {name!r}")
+    reg["active_group"] = name
+    save_registry(reg)
+
+
+def get_active_group() -> dict | None:
+    """Active group's config plus its own "name" key, or None."""
+    reg = load_registry()
+    name = reg.get("active_group")
+    if name is None or name not in reg["groups"]:
+        return None
+    return {"name": name, **reg["groups"][name]}
+
+
+def add_model(group_name: str, model: str, make_active: bool = True) -> None:
+    reg = load_registry()
+    if group_name not in reg["groups"]:
+        raise KeyError(f"no saved login named {group_name!r}")
+    group = reg["groups"][group_name]
+    if model not in group["models"]:
+        group["models"].append(model)
+    if make_active or not group.get("active_model"):
+        group["active_model"] = model
+    save_registry(reg)
+
+
+def set_active_model(group_name: str, model: str) -> None:
+    reg = load_registry()
+    if group_name not in reg["groups"]:
+        raise KeyError(f"no saved login named {group_name!r}")
+    group = reg["groups"][group_name]
+    if model not in group["models"]:
+        raise KeyError(f"no model {model!r} saved under login {group_name!r}")
+    group["active_model"] = model
     save_registry(reg)
 
 
 def get_active_profile() -> dict | None:
-    reg = load_registry()
-    name = reg.get("active")
-    if name is None:
+    """Flat {provider, api_key, model, base_url} for whichever group/model
+    is active — the shape model.py's resolve_provider() consumes."""
+    group = get_active_group()
+    if group is None or not group.get("active_model"):
         return None
-    return reg["profiles"].get(name)
+    return {
+        "provider": group["provider"],
+        "api_key": group["api_key"],
+        "model": group["active_model"],
+        "base_url": group.get("base_url"),
+    }
 
 
 def mask_key(key: str) -> str:

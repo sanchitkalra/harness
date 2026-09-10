@@ -95,7 +95,7 @@ def test_resolve_provider_raises_when_nothing_configured(monkeypatch):
 
 def test_resolve_provider_falls_back_to_registry_when_no_env_vars(monkeypatch):
     clear_keys(monkeypatch)
-    mr.add_profile("work", "anthropic", "sk-ant-xyz", "claude-sonnet-5")
+    mr.add_group("work", "anthropic", "sk-ant-xyz", "claude-sonnet-5")
     p = resolve_provider()
     assert isinstance(p, AnthropicProvider)
     assert p.model == "claude-sonnet-5"
@@ -104,7 +104,7 @@ def test_resolve_provider_falls_back_to_registry_when_no_env_vars(monkeypatch):
 
 def test_resolve_provider_env_vars_win_over_registry(monkeypatch):
     clear_keys(monkeypatch)
-    mr.add_profile("work", "anthropic", "sk-ant-xyz", "claude-sonnet-5")
+    mr.add_group("work", "anthropic", "sk-ant-xyz", "claude-sonnet-5")
     monkeypatch.setenv("MODEL_API_KEY", "k")
     p = resolve_provider()
     assert isinstance(p, OpenAIProvider)
@@ -113,7 +113,7 @@ def test_resolve_provider_env_vars_win_over_registry(monkeypatch):
 
 def test_resolve_provider_registry_openai_profile(monkeypatch):
     clear_keys(monkeypatch)
-    mr.add_profile("cheap", "openai", "sk-oai", "gpt-4o-mini")
+    mr.add_group("cheap", "openai", "sk-oai", "gpt-4o-mini")
     p = resolve_provider()
     assert isinstance(p, OpenAIProvider)
     assert p.model == "gpt-4o-mini"

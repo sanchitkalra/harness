@@ -58,17 +58,19 @@ Provider precedence: `OPENAI_API_KEY` > `ANTHROPIC_API_KEY` > `MODEL_API_KEY` (M
 
 ## Save model config instead of exporting env vars every run
 
-In the TUI, type `/model` to open a picker of saved profiles, or add a new
-one (name, provider, API key, model). The picked profile becomes active
-immediately and is remembered in `~/.config/harness/models.json` (mode 600)
-for every future run — no env vars needed. Env vars still override it when
-set. Opening `harness -i` with nothing configured at all now works (it used
-to hard-exit) — it starts with a tip to run `/model`.
+In the TUI, type `/login` to open a picker of saved logins (name, provider —
+anthropic/openai/compatible —, API key, base URL) or add a new one. `/model`
+then picks or adds a model within the active login, so switching models
+doesn't require re-entering credentials. Both are remembered in
+`~/.config/harness/models.json` (mode 600) for every future run — no env
+vars needed. Env vars still override it when set. Opening `harness -i` with
+nothing configured at all now works (it used to hard-exit) — it starts with
+a tip to run `/login`.
 
 ## What's inside (learning map)
 
 - `model.py` — `resolve_provider()` picks a `Provider` strategy (`OpenAIProvider` / `AnthropicProvider`) from env vars, then the saved registry; `llm_call()` calls it. Knows nothing about tools or files. Add a provider by writing a class with `model` + `call(messages, tools)` and wiring it into `resolve_provider()`.
-- `model_registry.py` — persisted `(provider, api_key, model)` profiles at `~/.config/harness/models.json`; managed via `/model` in the TUI.
+- `model_registry.py` — persisted logins (`provider`, `api_key`, `base_url`, and the models saved under them) at `~/.config/harness/models.json`; logins managed via `/login`, models within the active login via `/model` in the TUI.
 - `tools.py` — `TOOLS`, `resolve()` sandbox, `tool_read / tool_edit / tool_write / tool_bash`, `dispatch()`
 - `ui.py` — terminal rendering (ANSI on tty only); takes plain data, never imports the other modules
 - `agent.py` — `run()` loop, session headers + `--list` / `--fork`, `load_instructions()`, `smoke_test()`, CLI
